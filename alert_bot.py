@@ -539,18 +539,21 @@ def check_only():
 
     results = []
     for symbol in symbols:
-        candles = fetch_crypto_candles(symbol) if is_crypto else fetch_candles(symbol)
-        if not candles:
-            print(f"{symbol}: no candle data, skipping", file=sys.stderr)
-            continue
-        triggered, snapshot = check_confluence(candles)
-        if force:
-            print(f"{symbol}: FORCE_TRIGGER set, forcing trigger", file=sys.stderr)
-            triggered = True
-        if triggered:
-            results.append({"symbol": symbol, "snapshot": snapshot, "is_crypto": is_crypto})
-        else:
-            print(f"{symbol}: no confluence this cycle", file=sys.stderr)
+        try:
+            candles = fetch_crypto_candles(symbol) if is_crypto else fetch_candles(symbol)
+            if not candles:
+                print(f"{symbol}: no candle data, skipping", file=sys.stderr)
+                continue
+            triggered, snapshot = check_confluence(candles)
+            if force:
+                print(f"{symbol}: FORCE_TRIGGER set, forcing trigger", file=sys.stderr)
+                triggered = True
+            if triggered:
+                results.append({"symbol": symbol, "snapshot": snapshot, "is_crypto": is_crypto})
+            else:
+                print(f"{symbol}: no confluence this cycle", file=sys.stderr)
+        except Exception as e:
+            print(f"{symbol}: unhandled error during check ({e}), skipping this ticker, others still proceed", file=sys.stderr)
 
     print(json.dumps(results))
 
