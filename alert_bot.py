@@ -1,0 +1,303 @@
+"""
+Long-only technical + AI council trade alert bot.
+
+Runs on a GitHub Actions cron. For each ticker: pulls daily candles from
+Finnhub and checks for an EMA/RSI/volume confluence. If it fires, pulls
+fundamentals + recent news, asks a 4-model AI council for independent
+takes, has a chairman model reconcile them, and pushes the verdict via
+ntfy. Fails open at every stage past the technical check: a broken news
+call or a dead council member still results in an alert, just a plainer
+one.
+"""
+
+import os
+import json
+import time
+import requests
+
+# ── Config ──────────────────────────────────────────────────────────
+
+FINNHUB_KEY = os.environ["FINNHUB_API_KEY"]
+GROQ_KEY = os.environ["GROQ_API_KEY"]
+OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
+TAVILY_KEY = os.environ["TAVILY_API_KEY"]
+NTFY_TOPIC = os.environ["NTFY_TOPIC"]
+
+# "5", "15", "60", or "D". Set per-workflow via the RESOLUTION env var.
+RESOLUTION = os.environ.get("RESOLUTION", "D")
+
+# Halal-screened watchlist. Edit this yourself, nothing here gets
+# auto-added. Long-only, no leverage, no options, no shorting.
+TICKERS = ["NVDA", "AMD"]
+
+EMA_LEN = 50
+RSI_LEN = 14
+RSI_FLOOR = 30
+RSI_CEIL = 50
+VOL_LEN = 20
+VOL_MULT = 1.5
+WINDOW_BARS = 4
+
+# Free-tagged OpenRouter model IDs drift over time. If a council member
+# starts erroring, check openrouter.ai/models for the current :free slug.
+OPENROUTER_MODELS = {
+    "OpenRouter / DeepSeek R1": "deepseek/deepseek-r1:free",
+    "OpenRouter / Qwen3": "qwen/qwen3-235b-a22b:free",
+    "OpenRouter / Gemma 3": "google/gemma-3-27b-it:free",
+}
+
+# ── Technical indicators ────────────────────────────────────────────
+
+def ema(values, length):
+    k = 2 / (length + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
+def rsi(values, length):
+    """Wilder-smoothed RSI, matches Pine's ta.rsi()."""
+    out = [None] * len(values)
+    if len(values) <= length:
+        return out
+    gains = [max(values[i] - values[i - 1], 0) for i in range(1, len(values))]
+    losses = [max(values[i - 1] - values[i], 0) for i in range(1, len(values))]
+    avg_gain = sum(gains[:length]) / length
+    avg_loss = sum(losses[:length]) / length
+    rs = avg_gain / avg_loss if avg_loss else float("inf")
+    out[length] = 100 - 100 / (1 + rs)
+    for i in range(length, len(gains)):
+        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
+        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
+        rs = avg_gain / avg_loss if avg_loss else float("inf")
+        out[i + 1] = 100 - 100 / (1 + rs)
+    return out
+
+
+def sma(values, length):
+    out = [None] * len(values)
+    for i in range(length - 1, len(values)):
+        out[i] = sum(values[i - length + 1 : i + 1]) / length
+    return out
+
+
+def fetch_candles(symbol):
+    to_ts = int(time.time())
+    lookback_days = 200 if RESOLUTION == "D" else 10  # intraday history is capped much tighter on free tier
+    from_ts = to_ts - 60 * 60 * 24 * lookback_days
+    r = requests.get(
+        "https://finnhub.io/api/v1/stock/candle",
+        params={"symbol": symbol, "resolution": RESOLUTION, "from": from_ts, "to": to_ts, "token": FINNHUB_KEY},
+        timeout=15,
+    )
+    if r.status_code == 403:
+        print(f"{symbol}: 403 from Finnhub, resolution {RESOLUTION} likely needs a paid plan. Raw response: {r.text}")
+        return None
+    r.raise_for_status()
+    data = r.json()
+    if data.get("s") != "ok":
+        print(f"{symbol}: candle fetch returned status '{data.get('s')}', not 'ok'. Raw response: {data}")
+        return None
+    return data
+
+
+def check_confluence(candles):
+    closes = candles["c"]
+    volumes = candles["v"]
+    if len(closes) < EMA_LEN + WINDOW_BARS:
+        return False, {}
+
+    ema50 = ema(closes, EMA_LEN)
+    rsi14 = rsi(closes, RSI_LEN)
+    vol_avg = sma(volumes, VOL_LEN)
+
+    def bars_since(cond_fn):
+        idx = len(closes) - 1
+        for back in range(WINDOW_BARS + 1):
+            i = idx - back
+            if i < 1:
+                break
+            if cond_fn(i):
+                return back
+        return None
+
+    def price_cross(i):
+        return closes[i - 1] <= ema50[i - 1] and closes[i] > ema50[i]
+
+    def rsi_recovering(i):
+        if rsi14[i] is None or rsi14[i - 1] is None:
+            return False
+        return RSI_FLOOR < rsi14[i] < RSI_CEIL and rsi14[i] > rsi14[i - 1]
+
+    def vol_spike(i):
+        return vol_avg[i] is not None and volumes[i] > vol_avg[i] * VOL_MULT
+
+    price_hit = bars_since(price_cross)
+    rsi_hit = bars_since(rsi_recovering)
+    vol_hit = bars_since(vol_spike)
+
+    triggered = price_hit is not None and rsi_hit is not None and vol_hit is not None
+    snapshot = {
+        "close": closes[-1],
+        "ema50": round(ema50[-1], 2),
+        "rsi14": round(rsi14[-1], 2) if rsi14[-1] is not None else None,
+        "volume": volumes[-1],
+        "vol_avg20": round(vol_avg[-1], 2) if vol_avg[-1] is not None else None,
+    }
+    return triggered, snapshot
+
+
+# ── Context gathering (only runs on a confirmed trigger) ────────────
+
+def fetch_fundamentals(symbol):
+    try:
+        r = requests.get(
+            "https://finnhub.io/api/v1/stock/metric",
+            params={"symbol": symbol, "metric": "all", "token": FINNHUB_KEY},
+            timeout=15,
+        )
+        r.raise_for_status()
+        m = r.json().get("metric", {})
+        return {
+            "pe": m.get("peBasicExclExtraTTM"),
+            "debt_to_equity": m.get("totalDebt/totalEquityQuarterly"),
+            "52w_high": m.get("52WeekHigh"),
+            "52w_low": m.get("52WeekLow"),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def fetch_news(symbol):
+    try:
+        r = requests.post(
+            "https://api.tavily.com/search",
+            headers={"Authorization": f"Bearer {TAVILY_KEY}"},
+            json={
+                "query": symbol,
+                "topic": "news",
+                "days": 7,
+                "max_results": 5,
+                "search_depth": "advanced",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        results = r.json().get("results", [])
+        return [{"title": x["title"], "url": x["url"], "content": x["content"][:400]} for x in results]
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+# ── AI council ───────────────────────────────────────────────────────
+
+def build_prompt(symbol, snapshot, fundamentals, news):
+    news_block = "\n".join(
+        f"- {n.get('title', '?')}: {n.get('content', '')}" for n in news if "error" not in n
+    ) or "No recent news found."
+    return f"""You are analyzing {symbol} for a long-only, halal-compliant trader.
+A technical signal just fired: price crossed above the 50-day EMA, RSI(14) is
+recovering through the 30-50 range, and volume is running above 1.5x its
+20-day average, all within the last few bars.
+
+Technical snapshot: {json.dumps(snapshot)}
+Fundamentals: {json.dumps(fundamentals)}
+Recent news (last 7 days):
+{news_block}
+
+Give a short, fact-based take: buy, hold, or sell, and 2-3 sentences of
+reasoning grounded only in the data above. Do not invent facts not present here."""
+
+
+def call_groq(prompt, model="llama-3.3-70b-versatile"):
+    r = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_KEY}"},
+        json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def call_openrouter(prompt, model):
+    r = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+        json={"model": model, "messages": [{"role": "user", "content": prompt}]},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def run_council(symbol, snapshot, fundamentals, news):
+    prompt = build_prompt(symbol, snapshot, fundamentals, news)
+
+    opinions = {}
+    try:
+        opinions["Groq / Llama 3.3 70B"] = call_groq(prompt)
+    except Exception as e:
+        opinions["Groq / Llama 3.3 70B"] = f"(no response: {e})"
+
+    for name, model in OPENROUTER_MODELS.items():
+        try:
+            opinions[name] = call_openrouter(prompt, model)
+        except Exception as e:
+            opinions[name] = f"(no response: {e})"
+
+    responded = {k: v for k, v in opinions.items() if not v.startswith("(no response")}
+    if not responded:
+        return None, opinions
+
+    chairman_prompt = f"""Four analysts gave independent takes on {symbol}. Reconcile
+them into one final verdict: buy, hold, or sell. Note where they agree or
+disagree, then give the verdict in one clear line at the top.
+
+{json.dumps(responded, indent=2)}"""
+    try:
+        verdict = call_groq(chairman_prompt)
+    except Exception as e:
+        verdict = f"Chairman failed ({e}), raw opinions:\n" + json.dumps(responded, indent=2)
+
+    return verdict, opinions
+
+
+# ── Delivery ─────────────────────────────────────────────────────────
+
+def send_alert(symbol, snapshot, verdict):
+    title = f"{symbol} signal"
+    body = verdict if verdict else f"Confluence fired but the AI council was unreachable.\n{json.dumps(snapshot)}"
+    requests.post(
+        f"https://ntfy.sh/{NTFY_TOPIC}",
+        data=body.encode("utf-8"),
+        headers={"Title": title},
+        timeout=15,
+    )
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+def main():
+    for symbol in TICKERS:
+        candles = fetch_candles(symbol)
+        if not candles:
+            print(f"{symbol}: no candle data, skipping")
+            continue
+
+        triggered, snapshot = check_confluence(candles)
+        if not triggered:
+            print(f"{symbol}: no confluence this cycle")
+            continue
+
+        print(f"{symbol}: confluence triggered, gathering context")
+        fundamentals = fetch_fundamentals(symbol)
+        news = fetch_news(symbol)
+        verdict, opinions = run_council(symbol, snapshot, fundamentals, news)
+        send_alert(symbol, snapshot, verdict)
+        print(f"{symbol}: alert sent")
+
+
+if __name__ == "__main__":
+    main()
