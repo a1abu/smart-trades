@@ -35,7 +35,11 @@ ALPACA_TIMEFRAME = {"5": "5Min", "15": "15Min", "60": "1Hour", "D": "1Day"}[RESO
 
 # Halal-screened watchlist. Edit this yourself, nothing here gets
 # auto-added. Long-only, no leverage, no options, no shorting.
-TICKERS = ["NVDA", "AMD"]
+TICKERS = ["NVDA", "AMD", "IAU"]
+
+# Crypto uses a different Alpaca endpoint, symbol format, and schedule
+# (24/7, not tied to US market hours). See ASSET_CLASS handling in main().
+CRYPTO_TICKERS = ["BTC/USD"]
 
 EMA_LEN = 50
 RSI_LEN = 14
@@ -112,6 +116,32 @@ def fetch_candles(symbol):
     }
 
 
+def fetch_crypto_candles(symbol):
+    """Alpaca's crypto endpoint: different URL, no feed param (crypto data
+    isn't licensed/delayed like equities), and bars come back nested under
+    the symbol rather than as a flat list."""
+    lookback_days = 14
+    start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r = requests.get(
+        "https://data.alpaca.markets/v1beta3/crypto/us/bars",
+        headers={"APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY},
+        params={"symbols": symbol, "timeframe": ALPACA_TIMEFRAME, "start": start, "limit": 500},
+        timeout=15,
+    )
+    if r.status_code in (401, 403):
+        print(f"{symbol}: {r.status_code} from Alpaca crypto, check ALPACA_KEY_ID/ALPACA_SECRET_KEY. Raw response: {r.text}")
+        return None
+    r.raise_for_status()
+    bars = r.json().get("bars", {}).get(symbol)
+    if not bars:
+        print(f"{symbol}: no crypto bars returned for {ALPACA_TIMEFRAME}. Raw response: {r.text}")
+        return None
+    return {
+        "c": [b["c"] for b in bars],
+        "v": [b["v"] for b in bars],
+    }
+
+
 def check_confluence(candles):
     closes = candles["c"]
     volumes = candles["v"]
@@ -160,7 +190,9 @@ def check_confluence(candles):
 
 # ── Context gathering (only runs on a confirmed trigger) ────────────
 
-def fetch_fundamentals(symbol):
+def fetch_fundamentals(symbol, is_crypto=False):
+    if is_crypto:
+        return {"note": "Traditional fundamentals (P/E, debt/equity) don't apply to crypto assets."}
     try:
         r = requests.get(
             "https://finnhub.io/api/v1/stock/metric",
@@ -202,21 +234,27 @@ def fetch_news(symbol):
 
 # ── AI council ───────────────────────────────────────────────────────
 
-def build_prompt(symbol, snapshot, fundamentals, news):
+def build_prompt(symbol, snapshot, fundamentals, news, is_crypto=False):
     news_block = "\n".join(
         f"- {n.get('title', '?')}: {n.get('content', '')}" for n in news if "error" not in n
     ) or "No recent news found."
+
+    if is_crypto:
+        weighting = """This is a crypto asset. Traditional fundamentals like P/E or debt
+ratios don't apply, ignore the fundamentals field below beyond its note.
+Weight recent news and market narrative most heavily instead."""
+    else:
+        weighting = "Your verdict should be driven primarily by the fundamentals and news below."
+
     return f"""You are one of several independent analysts evaluating {symbol} for a
 long-only, halal-compliant trader. A technical signal fired, that's only a
-trigger to look, not evidence of anything on its own. Your verdict should
-be driven primarily by the fundamentals and news below, not by the fact
-that a technical signal fired.
+trigger to look, not evidence of anything on its own. {weighting}
 
 Technical snapshot (context only, weight this least): {json.dumps(snapshot)}
 
-Fundamentals (weight this most): {json.dumps(fundamentals)}
+Fundamentals: {json.dumps(fundamentals)}
 
-Recent news, last 7 days (weight this second-most):
+Recent news, last 7 days:
 {news_block}
 
 Do the following, in order:
@@ -266,8 +304,8 @@ def call_openrouter(prompt, model):
     return r.json()["choices"][0]["message"]["content"]
 
 
-def run_council(symbol, snapshot, fundamentals, news):
-    prompt = build_prompt(symbol, snapshot, fundamentals, news)
+def run_council(symbol, snapshot, fundamentals, news, is_crypto=False):
+    prompt = build_prompt(symbol, snapshot, fundamentals, news, is_crypto=is_crypto)
 
     opinions = {}
     try:
@@ -333,8 +371,12 @@ def send_alert(symbol, snapshot, verdict):
 
 def main():
     force = os.environ.get("FORCE_TRIGGER") == "1"
-    for symbol in TICKERS:
-        candles = fetch_candles(symbol)
+    asset_class = os.environ.get("ASSET_CLASS", "stocks")
+    is_crypto = asset_class == "crypto"
+    symbols = CRYPTO_TICKERS if is_crypto else TICKERS
+
+    for symbol in symbols:
+        candles = fetch_crypto_candles(symbol) if is_crypto else fetch_candles(symbol)
         if not candles:
             print(f"{symbol}: no candle data, skipping")
             continue
@@ -348,9 +390,10 @@ def main():
             continue
 
         print(f"{symbol}: confluence triggered, gathering context")
-        fundamentals = fetch_fundamentals(symbol)
-        news = fetch_news(symbol)
-        verdict, opinions = run_council(symbol, snapshot, fundamentals, news)
+        fundamentals = fetch_fundamentals(symbol, is_crypto=is_crypto)
+        news_query = symbol.replace("/USD", "") if is_crypto else symbol
+        news = fetch_news(news_query)
+        verdict, opinions = run_council(symbol, snapshot, fundamentals, news, is_crypto=is_crypto)
         send_alert(symbol, snapshot, verdict)
         print(f"{symbol}: alert sent")
 
