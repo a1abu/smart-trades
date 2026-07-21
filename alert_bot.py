@@ -211,7 +211,7 @@ def fetch_fundamentals(symbol, is_crypto=False):
         return {"error": str(e)}
 
 
-def fetch_news(symbol):
+def fetch_tavily_news(symbol):
     try:
         r = requests.post(
             "https://api.tavily.com/search",
@@ -229,7 +229,76 @@ def fetch_news(symbol):
         results = r.json().get("results", [])
         return [{"title": x["title"], "url": x["url"], "content": x["content"][:400]} for x in results]
     except Exception as e:
-        return [{"error": str(e)}]
+        return [{"error": f"Tavily: {e}"}]
+
+
+def fetch_finnhub_news(symbol):
+    """North American companies only. Returns thin/empty for funds like IAU."""
+    try:
+        to_date = datetime.now(timezone.utc).date()
+        from_date = to_date - timedelta(days=7)
+        r = requests.get(
+            "https://finnhub.io/api/v1/company-news",
+            params={"symbol": symbol, "from": from_date.isoformat(), "to": to_date.isoformat(), "token": FINNHUB_KEY},
+            timeout=15,
+        )
+        r.raise_for_status()
+        results = r.json()[:5]
+        return [{"title": x["headline"], "url": x["url"], "content": x.get("summary", "")[:400]} for x in results]
+    except Exception as e:
+        return [{"error": f"Finnhub news: {e}"}]
+
+
+_CIK_CACHE = None
+_SEC_HEADERS = {"User-Agent": "smart-trades-personal-bot contact@example.com"}
+
+
+def _get_cik(symbol):
+    global _CIK_CACHE
+    if _CIK_CACHE is None:
+        r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=_SEC_HEADERS, timeout=15)
+        r.raise_for_status()
+        _CIK_CACHE = {v["ticker"]: str(v["cik_str"]).zfill(10) for v in r.json().values()}
+    return _CIK_CACHE.get(symbol)
+
+
+def fetch_sec_filings(symbol):
+    """Recent 8-K (material event) filings, straight from SEC EDGAR. Free,
+    no key, but doesn't apply to funds/crypto the same way as operating
+    companies, expect it to come back empty for IAU sometimes."""
+    try:
+        cik = _get_cik(symbol)
+        if not cik:
+            return []
+        r = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json", headers=_SEC_HEADERS, timeout=15)
+        r.raise_for_status()
+        recent = r.json().get("filings", {}).get("recent", {})
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).date()
+        cik_int = cik.lstrip("0")
+        out = []
+        for form, date_str, acc, doc in zip(
+            recent.get("form", []), recent.get("filingDate", []),
+            recent.get("accessionNumber", []), recent.get("primaryDocument", []),
+        ):
+            if form != "8-K":
+                continue
+            if datetime.strptime(date_str, "%Y-%m-%d").date() < cutoff:
+                continue
+            url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc.replace('-', '')}/{doc}"
+            out.append({"title": f"8-K filed {date_str}", "url": url, "content": "Material event disclosure, see filing."})
+        return out
+    except Exception as e:
+        return [{"error": f"SEC EDGAR: {e}"}]
+
+
+def fetch_news(symbol, is_crypto=False):
+    """Merges Tavily, Finnhub news, and SEC filings. Each source fails
+    open independently, one breaking doesn't drop the others."""
+    combined = fetch_tavily_news(symbol)
+    if not is_crypto:
+        combined += fetch_finnhub_news(symbol)
+        combined += fetch_sec_filings(symbol)
+    return combined
 
 
 # ── AI council ───────────────────────────────────────────────────────
@@ -392,7 +461,7 @@ def main():
         print(f"{symbol}: confluence triggered, gathering context")
         fundamentals = fetch_fundamentals(symbol, is_crypto=is_crypto)
         news_query = symbol.replace("/USD", "") if is_crypto else symbol
-        news = fetch_news(news_query)
+        news = fetch_news(news_query, is_crypto=is_crypto)
         verdict, opinions = run_council(symbol, snapshot, fundamentals, news, is_crypto=is_crypto)
         send_alert(symbol, snapshot, verdict)
         print(f"{symbol}: alert sent")
