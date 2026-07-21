@@ -32,7 +32,7 @@ jobs:
 
   analyze:
     needs: check
-    if: needs.check.outputs.triggered != '[]'
+    if: fromJson(needs.check.outputs.triggered)[0] != null
     runs-on: ubuntu-latest
     permissions:
       contents: write
