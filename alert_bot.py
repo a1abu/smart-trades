@@ -13,7 +13,7 @@ member still results in an alert, just a plainer one.
 import os
 import json
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 
 # ── Config ──────────────────────────────────────────────────────────
 
@@ -91,7 +91,7 @@ def sma(values, length):
 
 def fetch_candles(symbol):
     lookback_days = 200 if RESOLUTION == "D" else 14  # intraday only needs ~14 days for 50+ bars
-    start = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get(
         f"https://data.alpaca.markets/v2/stocks/{symbol}/bars",
         headers={"APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY},
@@ -290,6 +290,7 @@ def send_alert(symbol, snapshot, verdict):
 # ── Main ─────────────────────────────────────────────────────────────
 
 def main():
+    force = os.environ.get("FORCE_TRIGGER") == "1"
     for symbol in TICKERS:
         candles = fetch_candles(symbol)
         if not candles:
@@ -297,6 +298,9 @@ def main():
             continue
 
         triggered, snapshot = check_confluence(candles)
+        if force:
+            print(f"{symbol}: FORCE_TRIGGER set, running full pipeline regardless of confluence result")
+            triggered = True
         if not triggered:
             print(f"{symbol}: no confluence this cycle")
             continue
