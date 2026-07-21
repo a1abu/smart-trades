@@ -22,7 +22,9 @@ jobs:
           python-version: "3.12"
       - run: pip install requests
       - id: run_check
-        run: echo "triggered=$(python alert_bot.py check)" >> "$GITHUB_OUTPUT"
+        run: |
+          result=$(python alert_bot.py check)
+          echo "triggered=$result" >> "$GITHUB_OUTPUT"
         env:
           RESOLUTION: "15"
           ASSET_CLASS: "crypto"
