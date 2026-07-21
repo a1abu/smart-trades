@@ -236,7 +236,7 @@ Rules:
 data doesn't support a claim, don't make it.
 - "Hold" is not a safe default. Only land on hold if the bull and bear
 cases are genuinely close in strength, and say why. Don't pick it just to
-avoid committing to a read.
+avoid committing to a read. THAT DOES NOT MEAN that you force a "Buy" or "Sell". You base your verdict on facts.
 - Don't invent facts not present in the data above.
 - Skip disclaimers and hedge phrases that aren't backed by a specific
 number from the data.
