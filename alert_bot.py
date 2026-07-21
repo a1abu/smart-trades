@@ -206,18 +206,42 @@ def build_prompt(symbol, snapshot, fundamentals, news):
     news_block = "\n".join(
         f"- {n.get('title', '?')}: {n.get('content', '')}" for n in news if "error" not in n
     ) or "No recent news found."
-    return f"""You are analyzing {symbol} for a long-only, halal-compliant trader.
-A technical signal just fired: price crossed above the 50-day EMA, RSI(14) is
-recovering through the 30-50 range, and volume is running above 1.5x its
-20-day average, all within the last few bars.
+    return f"""You are one of several independent analysts evaluating {symbol} for a
+long-only, halal-compliant trader. A technical signal fired, that's only a
+trigger to look, not evidence of anything on its own. Your verdict should
+be driven primarily by the fundamentals and news below, not by the fact
+that a technical signal fired.
 
-Technical snapshot: {json.dumps(snapshot)}
-Fundamentals: {json.dumps(fundamentals)}
-Recent news (last 7 days):
+Technical snapshot (context only, weight this least): {json.dumps(snapshot)}
+
+Fundamentals (weight this most): {json.dumps(fundamentals)}
+
+Recent news, last 7 days (weight this second-most):
 {news_block}
 
-Give a short, fact-based take: buy, hold, or sell, and 2-3 sentences of
-reasoning grounded only in the data above. Do not invent facts not present here."""
+Do the following, in order:
+
+1. State the strongest case FOR buying, citing specific numbers or facts
+from the data above. If you can't find a genuinely strong case, say so
+rather than inventing one.
+
+2. State the strongest case AGAINST buying (for holding or selling),
+citing specific numbers or facts from the data above.
+
+3. Weigh the two cases against each other and give your verdict: buy,
+hold, or sell.
+
+Rules:
+- Every claim must trace to a specific number or fact given above. If the
+data doesn't support a claim, don't make it.
+- "Hold" is not a safe default. Only land on hold if the bull and bear
+cases are genuinely close in strength, and say why. Don't pick it just to
+avoid committing to a read.
+- Don't invent facts not present in the data above.
+- Skip disclaimers and hedge phrases that aren't backed by a specific
+number from the data.
+
+Keep the whole response between 50 and 250 words."""
 
 
 def call_groq(prompt, model="llama-3.3-70b-versatile"):
@@ -261,9 +285,27 @@ def run_council(symbol, snapshot, fundamentals, news):
     if not responded:
         return None, opinions
 
-    chairman_prompt = f"""Four analysts gave independent takes on {symbol}. Reconcile
-them into one final verdict: buy, hold, or sell. Note where they agree or
-disagree, then give the verdict in one clear line at the top.
+    chairman_prompt = f"""Four analysts each did a bull case / bear case / verdict on
+{symbol}, independently and without seeing each other's work. Reconcile
+them into one final call, don't just tally votes.
+
+Weigh how strong each analyst's evidence actually was, not just what they
+concluded. A verdict backed by a specific number beats a verdict backed by
+vague reasoning, even if more analysts landed on the other side. A 3-1
+split doesn't automatically mean the 3 are right if the 1 dissenter cited
+a hard number the others ignored.
+
+Give, in order:
+1. Where the analysts genuinely agree, and on what evidence.
+2. Where they disagree, and which side has the stronger evidence.
+3. Final verdict as the first line, exactly one word: BUY, HOLD, or SELL.
+4. 2-3 sentences explaining the verdict, citing the specific evidence that
+tipped it, not just "most analysts agreed."
+
+Don't let "hold" absorb a genuine disagreement, if the evidence actually
+points a direction, say so even if the analysts split.
+
+Make sure that the response is readable but still informative, NOT ONLY bullet points but not only pure text either.
 
 {json.dumps(responded, indent=2)}"""
     try:
