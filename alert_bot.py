@@ -1,19 +1,19 @@
 """
 Long-only technical + AI council trade alert bot.
 
-Runs on a GitHub Actions cron. For each ticker: pulls daily candles from
-Finnhub and checks for an EMA/RSI/volume confluence. If it fires, pulls
-fundamentals + recent news, asks a 4-model AI council for independent
-takes, has a chairman model reconcile them, and pushes the verdict via
-ntfy. Fails open at every stage past the technical check: a broken news
-call or a dead council member still results in an alert, just a plainer
-one.
+Runs on a GitHub Actions cron. For each ticker: pulls candles from Alpaca
+(free tier, 15-min delayed) and checks for an EMA/RSI/volume confluence.
+If it fires, pulls fundamentals from Finnhub + recent news from Tavily,
+asks a 4-model AI council for independent takes, has a chairman model
+reconcile them, and pushes the verdict via ntfy. Fails open at every
+stage past the technical check: a broken news call or a dead council
+member still results in an alert, just a plainer one.
 """
 
 import os
 import json
-import time
 import requests
+from datetime import datetime, timedelta
 
 # ── Config ──────────────────────────────────────────────────────────
 
@@ -22,9 +22,16 @@ GROQ_KEY = os.environ["GROQ_API_KEY"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
 TAVILY_KEY = os.environ["TAVILY_API_KEY"]
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
+ALPACA_KEY_ID = os.environ["ALPACA_KEY_ID"]
+ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 
 # "5", "15", "60", or "D". Set per-workflow via the RESOLUTION env var.
 RESOLUTION = os.environ.get("RESOLUTION", "D")
+
+# Candles now come from Alpaca (free tier, 15-min delayed), not Finnhub,
+# whose free tier stopped serving historical/intraday candles. Finnhub
+# is still used below for fundamentals, which free tier does cover.
+ALPACA_TIMEFRAME = {"5": "5Min", "15": "15Min", "60": "1Hour", "D": "1Day"}[RESOLUTION]
 
 # Halal-screened watchlist. Edit this yourself, nothing here gets
 # auto-added. Long-only, no leverage, no options, no shorting.
@@ -83,23 +90,26 @@ def sma(values, length):
 
 
 def fetch_candles(symbol):
-    to_ts = int(time.time())
-    lookback_days = 200 if RESOLUTION == "D" else 10  # intraday history is capped much tighter on free tier
-    from_ts = to_ts - 60 * 60 * 24 * lookback_days
+    lookback_days = 200 if RESOLUTION == "D" else 14  # intraday only needs ~14 days for 50+ bars
+    start = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get(
-        "https://finnhub.io/api/v1/stock/candle",
-        params={"symbol": symbol, "resolution": RESOLUTION, "from": from_ts, "to": to_ts, "token": FINNHUB_KEY},
+        f"https://data.alpaca.markets/v2/stocks/{symbol}/bars",
+        headers={"APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY},
+        params={"timeframe": ALPACA_TIMEFRAME, "start": start, "limit": 500, "feed": "iex", "adjustment": "raw"},
         timeout=15,
     )
-    if r.status_code == 403:
-        print(f"{symbol}: 403 from Finnhub, resolution {RESOLUTION} likely needs a paid plan. Raw response: {r.text}")
+    if r.status_code in (401, 403):
+        print(f"{symbol}: {r.status_code} from Alpaca, check ALPACA_KEY_ID/ALPACA_SECRET_KEY. Raw response: {r.text}")
         return None
     r.raise_for_status()
-    data = r.json()
-    if data.get("s") != "ok":
-        print(f"{symbol}: candle fetch returned status '{data.get('s')}', not 'ok'. Raw response: {data}")
+    bars = r.json().get("bars")
+    if not bars:
+        print(f"{symbol}: no bars returned for {ALPACA_TIMEFRAME}. Raw response: {r.text}")
         return None
-    return data
+    return {
+        "c": [b["c"] for b in bars],
+        "v": [b["v"] for b in bars],
+    }
 
 
 def check_confluence(candles):
