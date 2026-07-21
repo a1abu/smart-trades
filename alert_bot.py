@@ -1,16 +1,25 @@
 """
-Long-only technical + AI council trade alert bot.
+Long-only technical + AI council trade alert bot, with a small RAG memory
+of past triggers.
 
-Runs on a GitHub Actions cron. For each ticker: pulls candles from Alpaca
-(free tier, 15-min delayed) and checks for an EMA/RSI/volume confluence.
-If it fires, pulls fundamentals from Finnhub + recent news from Tavily,
-asks a 4-model AI council for independent takes, has a chairman model
-reconcile them, and pushes the verdict via ntfy. Fails open at every
-stage past the technical check: a broken news call or a dead council
-member still results in an alert, just a plainer one.
+Split into two modes, run as separate GitHub Actions jobs so the heavy
+embedding dependency only installs on the rare cycle that actually
+triggers, not on every 5-15 minute cron tick:
+
+  python alert_bot.py check    - cheap: candles + confluence check only,
+                                  prints a JSON list of triggered tickers
+                                  to stdout for the workflow to capture
+  python alert_bot.py analyze  - only runs if check found something:
+                                  RAG retrieval, fundamentals, news, the
+                                  AI council, the alert, and saving the
+                                  new entry back to memory.json
+
+Fails open at every stage past the technical check: a broken news call
+or a dead council member still results in an alert, just a plainer one.
 """
 
 import os
+import sys
 import json
 import requests
 from datetime import datetime, timezone, timedelta
@@ -27,18 +36,11 @@ ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 
 # "5", "15", "60", or "D". Set per-workflow via the RESOLUTION env var.
 RESOLUTION = os.environ.get("RESOLUTION", "D")
-
-# Candles now come from Alpaca (free tier, 15-min delayed), not Finnhub,
-# whose free tier stopped serving historical/intraday candles. Finnhub
-# is still used below for fundamentals, which free tier does cover.
 ALPACA_TIMEFRAME = {"5": "5Min", "15": "15Min", "60": "1Hour", "D": "1Day"}[RESOLUTION]
 
 # Halal-screened watchlist. Edit this yourself, nothing here gets
 # auto-added. Long-only, no leverage, no options, no shorting.
 TICKERS = ["NVDA", "AMD", "IAU"]
-
-# Crypto uses a different Alpaca endpoint, symbol format, and schedule
-# (24/7, not tied to US market hours). See ASSET_CLASS handling in main().
 CRYPTO_TICKERS = ["BTC/USD"]
 
 EMA_LEN = 50
@@ -48,6 +50,14 @@ RSI_CEIL = 50
 VOL_LEN = 20
 VOL_MULT = 1.5
 WINDOW_BARS = 4
+
+MEMORY_FILE = "memory.json"
+RAG_TOP_K = 3
+
+# How many days after an alert to check whether the verdict held up.
+# Multiple horizons since a call can be right short-term and wrong
+# long-term, or the reverse, one checkpoint conflates those.
+HORIZONS = {"3d": 3, "7d": 7, "14d": 14, "30d": 30, "60d": 60, "90d": 90}
 
 # Free-tagged OpenRouter model IDs drift over time. If a council member
 # starts erroring, check openrouter.ai/models for the current :free slug.
@@ -94,7 +104,7 @@ def sma(values, length):
 
 
 def fetch_candles(symbol):
-    lookback_days = 200 if RESOLUTION == "D" else 14  # intraday only needs ~14 days for 50+ bars
+    lookback_days = 200 if RESOLUTION == "D" else 14
     start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get(
         f"https://data.alpaca.markets/v2/stocks/{symbol}/bars",
@@ -103,23 +113,17 @@ def fetch_candles(symbol):
         timeout=15,
     )
     if r.status_code in (401, 403):
-        print(f"{symbol}: {r.status_code} from Alpaca, check ALPACA_KEY_ID/ALPACA_SECRET_KEY. Raw response: {r.text}")
+        print(f"{symbol}: {r.status_code} from Alpaca, check ALPACA_KEY_ID/ALPACA_SECRET_KEY. Raw response: {r.text}", file=sys.stderr)
         return None
     r.raise_for_status()
     bars = r.json().get("bars")
     if not bars:
-        print(f"{symbol}: no bars returned for {ALPACA_TIMEFRAME}. Raw response: {r.text}")
+        print(f"{symbol}: no bars returned for {ALPACA_TIMEFRAME}. Raw response: {r.text}", file=sys.stderr)
         return None
-    return {
-        "c": [b["c"] for b in bars],
-        "v": [b["v"] for b in bars],
-    }
+    return {"c": [b["c"] for b in bars], "v": [b["v"] for b in bars]}
 
 
 def fetch_crypto_candles(symbol):
-    """Alpaca's crypto endpoint: different URL, no feed param (crypto data
-    isn't licensed/delayed like equities), and bars come back nested under
-    the symbol rather than as a flat list."""
     lookback_days = 14
     start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get(
@@ -129,17 +133,14 @@ def fetch_crypto_candles(symbol):
         timeout=15,
     )
     if r.status_code in (401, 403):
-        print(f"{symbol}: {r.status_code} from Alpaca crypto, check ALPACA_KEY_ID/ALPACA_SECRET_KEY. Raw response: {r.text}")
+        print(f"{symbol}: {r.status_code} from Alpaca crypto, check ALPACA_KEY_ID/ALPACA_SECRET_KEY. Raw response: {r.text}", file=sys.stderr)
         return None
     r.raise_for_status()
     bars = r.json().get("bars", {}).get(symbol)
     if not bars:
-        print(f"{symbol}: no crypto bars returned for {ALPACA_TIMEFRAME}. Raw response: {r.text}")
+        print(f"{symbol}: no crypto bars returned for {ALPACA_TIMEFRAME}. Raw response: {r.text}", file=sys.stderr)
         return None
-    return {
-        "c": [b["c"] for b in bars],
-        "v": [b["v"] for b in bars],
-    }
+    return {"c": [b["c"] for b in bars], "v": [b["v"] for b in bars]}
 
 
 def check_confluence(candles):
@@ -188,7 +189,7 @@ def check_confluence(candles):
     return triggered, snapshot
 
 
-# ── Context gathering (only runs on a confirmed trigger) ────────────
+# ── Context gathering (only runs in analyze mode) ───────────────────
 
 def fetch_fundamentals(symbol, is_crypto=False):
     if is_crypto:
@@ -216,13 +217,7 @@ def fetch_tavily_news(symbol):
         r = requests.post(
             "https://api.tavily.com/search",
             headers={"Authorization": f"Bearer {TAVILY_KEY}"},
-            json={
-                "query": symbol,
-                "topic": "news",
-                "days": 7,
-                "max_results": 5,
-                "search_depth": "advanced",
-            },
+            json={"query": symbol, "topic": "news", "days": 7, "max_results": 5, "search_depth": "advanced"},
             timeout=20,
         )
         r.raise_for_status()
@@ -233,7 +228,6 @@ def fetch_tavily_news(symbol):
 
 
 def fetch_finnhub_news(symbol):
-    """North American companies only. Returns thin/empty for funds like IAU."""
     try:
         to_date = datetime.now(timezone.utc).date()
         from_date = to_date - timedelta(days=7)
@@ -263,9 +257,6 @@ def _get_cik(symbol):
 
 
 def fetch_sec_filings(symbol):
-    """Recent 8-K (material event) filings, straight from SEC EDGAR. Free,
-    no key, but doesn't apply to funds/crypto the same way as operating
-    companies, expect it to come back empty for IAU sometimes."""
     try:
         cik = _get_cik(symbol)
         if not cik:
@@ -292,8 +283,6 @@ def fetch_sec_filings(symbol):
 
 
 def fetch_news(symbol, is_crypto=False):
-    """Merges Tavily, Finnhub news, and SEC filings. Each source fails
-    open independently, one breaking doesn't drop the others."""
     combined = fetch_tavily_news(symbol)
     if not is_crypto:
         combined += fetch_finnhub_news(symbol)
@@ -301,12 +290,105 @@ def fetch_news(symbol, is_crypto=False):
     return combined
 
 
+# ── RAG memory ───────────────────────────────────────────────────────
+
+_MODEL = None
+
+
+def _get_model():
+    global _MODEL
+    if _MODEL is None:
+        from sentence_transformers import SentenceTransformer
+        _MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+    return _MODEL
+
+
+def load_memory():
+    if not os.path.exists(MEMORY_FILE):
+        return []
+    try:
+        with open(MEMORY_FILE) as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"memory.json failed to load ({e}), starting fresh", file=sys.stderr)
+        return []
+
+
+def save_memory(memory):
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(memory, f, indent=2)
+
+
+def situation_text(symbol, snapshot, fundamentals, news):
+    titles = "; ".join(n.get("title", "") for n in news if "error" not in n)
+    return f"{symbol}: close {snapshot.get('close')}, RSI {snapshot.get('rsi14')}, volume {snapshot.get('volume')} vs avg {snapshot.get('vol_avg20')}. Fundamentals: {json.dumps(fundamentals)}. News: {titles}"
+
+
+def retrieve_similar(text, memory, top_k=RAG_TOP_K):
+    if not memory:
+        return []
+    try:
+        import numpy as np
+        model = _get_model()
+        query_emb = model.encode(text)
+        scored = []
+        for entry in memory:
+            past_emb = np.array(entry["embedding"])
+            denom = (np.linalg.norm(query_emb) * np.linalg.norm(past_emb)) or 1e-9
+            sim = float(np.dot(query_emb, past_emb) / denom)
+            scored.append((sim, entry))
+        scored.sort(key=lambda x: -x[0])
+        return [e for _, e in scored[:top_k]]
+    except Exception as e:
+        print(f"RAG retrieval failed ({e}), proceeding without memory context", file=sys.stderr)
+        return []
+
+
+def add_to_memory(memory, symbol, text, verdict, close_at_alert, is_crypto):
+    try:
+        model = _get_model()
+        emb = model.encode(text).tolist()
+        memory.append({
+            "symbol": symbol,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "text": text,
+            "embedding": emb,
+            "verdict": (verdict or "")[:500],
+            "close_at_alert": close_at_alert,
+            "is_crypto": is_crypto,
+            "outcomes": {h: {"checked": False} for h in HORIZONS},
+        })
+    except Exception as e:
+        print(f"Failed to add {symbol} to memory ({e}), skipping this entry", file=sys.stderr)
+    return memory
+
+
 # ── AI council ───────────────────────────────────────────────────────
 
-def build_prompt(symbol, snapshot, fundamentals, news, is_crypto=False):
+def build_prompt(symbol, snapshot, fundamentals, news, similar_past=None, is_crypto=False):
     news_block = "\n".join(
         f"- {n.get('title', '?')}: {n.get('content', '')}" for n in news if "error" not in n
     ) or "No recent news found."
+
+    if similar_past:
+        past_lines = []
+        for e in similar_past:
+            line = f"- {e['timestamp'][:10]}: {e['text'][:200]} -> verdict was: {e['verdict'][:150]}"
+            graded_parts = []
+            for h, data in (e.get("outcomes") or {}).items():
+                if not data.get("checked"):
+                    continue
+                result = "CORRECT" if data.get("correct") else "WRONG" if data.get("correct") is False else "ungraded"
+                part = f"{h}: {result} ({data.get('pct_change')}%)"
+                if data.get("reflection"):
+                    part += f" [why: {data['reflection'][:150]}]"
+                graded_parts.append(part)
+            if graded_parts:
+                line += " | GRADED OUTCOMES -> " + "; ".join(graded_parts)
+            past_lines.append(line)
+        past_block = "\n".join(past_lines)
+    else:
+        past_block = "No similar past situations in memory yet."
 
     if is_crypto:
         weighting = """This is a crypto asset. Traditional fundamentals like P/E or debt
@@ -325,6 +407,14 @@ Fundamentals: {json.dumps(fundamentals)}
 
 Recent news, last 7 days:
 {news_block}
+
+Similar past situations from memory. GRADED OUTCOMES reflect what actually
+happened to the price at specific timeframes, that's real evidence, weigh
+it seriously, and note that a call can be graded differently at different
+horizons (right at 3 days, wrong at 30, or the reverse). Anything without
+a graded outcome yet is just this system's own past opinion, unverified,
+weight that the lightest of everything given:
+{past_block}
 
 Do the following, in order:
 
@@ -355,7 +445,7 @@ def call_groq(prompt, model="llama-3.3-70b-versatile"):
     r = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_KEY}"},
-        json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
+        json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0},
         timeout=30,
     )
     r.raise_for_status()
@@ -366,15 +456,15 @@ def call_openrouter(prompt, model):
     r = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-        json={"model": model, "messages": [{"role": "user", "content": prompt}]},
+        json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0},
         timeout=30,
     )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
 
-def run_council(symbol, snapshot, fundamentals, news, is_crypto=False):
-    prompt = build_prompt(symbol, snapshot, fundamentals, news, is_crypto=is_crypto)
+def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_crypto=False):
+    prompt = build_prompt(symbol, snapshot, fundamentals, news, similar_past=similar_past, is_crypto=is_crypto)
 
     opinions = {}
     try:
@@ -436,36 +526,179 @@ def send_alert(symbol, snapshot, verdict):
     )
 
 
-# ── Main ─────────────────────────────────────────────────────────────
+# ── Modes ────────────────────────────────────────────────────────────
 
-def main():
-    force = os.environ.get("FORCE_TRIGGER") == "1"
+def check_only():
+    """Cheap phase: candles + confluence check only. Prints a single-line
+    JSON list to stdout, this is what the workflow captures as a job
+    output, so nothing else may print to stdout in this mode."""
     asset_class = os.environ.get("ASSET_CLASS", "stocks")
     is_crypto = asset_class == "crypto"
     symbols = CRYPTO_TICKERS if is_crypto else TICKERS
+    force = os.environ.get("FORCE_TRIGGER") == "1"
 
+    results = []
     for symbol in symbols:
         candles = fetch_crypto_candles(symbol) if is_crypto else fetch_candles(symbol)
         if not candles:
-            print(f"{symbol}: no candle data, skipping")
+            print(f"{symbol}: no candle data, skipping", file=sys.stderr)
             continue
-
         triggered, snapshot = check_confluence(candles)
         if force:
-            print(f"{symbol}: FORCE_TRIGGER set, running full pipeline regardless of confluence result")
+            print(f"{symbol}: FORCE_TRIGGER set, forcing trigger", file=sys.stderr)
             triggered = True
-        if not triggered:
-            print(f"{symbol}: no confluence this cycle")
-            continue
+        if triggered:
+            results.append({"symbol": symbol, "snapshot": snapshot, "is_crypto": is_crypto})
+        else:
+            print(f"{symbol}: no confluence this cycle", file=sys.stderr)
+
+    print(json.dumps(results))
+
+
+def analyze():
+    """Heavy phase: only runs when check found something. RAG retrieval,
+    fundamentals, news, the council, the alert, and saving memory."""
+    triggered_list = json.loads(os.environ.get("TRIGGERED", "[]"))
+    memory = load_memory()
+
+    for item in triggered_list:
+        symbol = item["symbol"]
+        snapshot = item["snapshot"]
+        is_crypto = item["is_crypto"]
 
         print(f"{symbol}: confluence triggered, gathering context")
         fundamentals = fetch_fundamentals(symbol, is_crypto=is_crypto)
         news_query = symbol.replace("/USD", "") if is_crypto else symbol
         news = fetch_news(news_query, is_crypto=is_crypto)
-        verdict, opinions = run_council(symbol, snapshot, fundamentals, news, is_crypto=is_crypto)
+
+        text = situation_text(symbol, snapshot, fundamentals, news)
+        similar_past = retrieve_similar(text, memory)
+        print(f"{symbol}: found {len(similar_past)} similar past situations in memory")
+
+        verdict, opinions = run_council(symbol, snapshot, fundamentals, news, similar_past=similar_past, is_crypto=is_crypto)
         send_alert(symbol, snapshot, verdict)
+
+        memory = add_to_memory(memory, symbol, text, verdict, snapshot.get("close"), is_crypto)
         print(f"{symbol}: alert sent")
+
+    save_memory(memory)
+
+
+def parse_verdict_direction(verdict_text):
+    if not verdict_text:
+        return None
+    head = verdict_text.upper()[:60]
+    if "BUY" in head:
+        return "BUY"
+    if "SELL" in head:
+        return "SELL"
+    if "HOLD" in head:
+        return "HOLD"
+    return None
+
+
+def grade_verdict(direction, pct_change, hold_threshold=3.0):
+    if direction == "BUY":
+        return pct_change > 0
+    if direction == "SELL":
+        return pct_change < 0
+    if direction == "HOLD":
+        return abs(pct_change) < hold_threshold
+    return None
+
+
+def build_reflection_prompt(entry, horizon_label, pct_change):
+    return f"""A trading verdict was given on {entry['timestamp'][:10]} for {entry['symbol']}.
+
+Original situation: {entry['text'][:600]}
+
+Verdict given: {entry['verdict'][:400]}
+
+Actual outcome at the {horizon_label} mark: price moved {pct_change:+.1f}%
+since the alert, which means this verdict was wrong over that specific
+horizon (it may still be graded differently at other horizons).
+
+In 2-3 sentences, identify what in the original reasoning was likely
+mistaken or what information was probably missing, specific to this
+timeframe. Be specific, reference the original reasoning directly, don't
+just restate that it was wrong."""
+
+
+def postcheck():
+    """Daily sweep: for every memory entry, check whichever horizons
+    (3d/7d/14d/30d/60d/90d) have now come due and haven't been graded
+    yet. Fetches each symbol's current price at most once per run, no
+    matter how many entries or horizons need it, then applies that price
+    across everything due. Only calls an LLM when a given horizon graded
+    wrong, correct horizons get graded silently."""
+    memory = load_memory()
+    now = datetime.now(timezone.utc)
+    updated = False
+    price_cache = {}
+
+    def current_price(symbol, is_crypto):
+        if symbol not in price_cache:
+            candles = fetch_crypto_candles(symbol) if is_crypto else fetch_candles(symbol)
+            price_cache[symbol] = candles["c"][-1] if candles else None
+        return price_cache[symbol]
+
+    for entry in memory:
+        try:
+            entry_time = datetime.fromisoformat(entry["timestamp"])
+        except Exception:
+            continue
+        age_days = (now - entry_time).total_seconds() / 86400
+        symbol = entry["symbol"]
+        is_crypto = entry.get("is_crypto", False)
+        original_price = entry.get("close_at_alert")
+        outcomes = entry.setdefault("outcomes", {h: {"checked": False} for h in HORIZONS})
+
+        for label, horizon_days in HORIZONS.items():
+            slot = outcomes.setdefault(label, {"checked": False})
+            if slot.get("checked") or age_days < horizon_days:
+                continue
+
+            if not original_price:
+                slot.update({"checked": True, "correct": None})
+                updated = True
+                continue
+
+            price = current_price(symbol, is_crypto)
+            if price is None:
+                print(f"{symbol}: couldn't fetch current price this run, {label} check deferred", file=sys.stderr)
+                continue
+
+            pct_change = (price - original_price) / original_price * 100
+            direction = parse_verdict_direction(entry.get("verdict"))
+            correct = grade_verdict(direction, pct_change)
+
+            slot["checked"] = True
+            slot["pct_change"] = round(pct_change, 2)
+            slot["correct"] = correct
+
+            if correct is False:
+                try:
+                    slot["reflection"] = call_groq(build_reflection_prompt(entry, label, pct_change))[:500]
+                except Exception as e:
+                    print(f"{symbol}: reflection call failed ({e}) for {label}, grading without one", file=sys.stderr)
+
+            print(f"{symbol}: {label} graded, {pct_change:+.1f}%, verdict was {'correct' if correct else 'wrong' if correct is False else 'ungraded'}")
+            updated = True
+
+    if updated:
+        save_memory(memory)
+    else:
+        print("nothing due for postcheck this run")
 
 
 if __name__ == "__main__":
-    main()
+    mode = sys.argv[1] if len(sys.argv) > 1 else "check"
+    if mode == "check":
+        check_only()
+    elif mode == "analyze":
+        analyze()
+    elif mode == "postcheck":
+        postcheck()
+    else:
+        print(f"Unknown mode: {mode}", file=sys.stderr)
+        sys.exit(1)
