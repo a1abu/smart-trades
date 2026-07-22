@@ -103,13 +103,13 @@ def sma(values, length):
     return out
 
 
-def fetch_candles(symbol):
-    lookback_days = 200 if RESOLUTION == "D" else 14
+def fetch_candles(symbol, lookback_days=None, limit=500):
+    lookback_days = lookback_days if lookback_days is not None else (200 if RESOLUTION == "D" else 14)
     start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get(
         f"https://data.alpaca.markets/v2/stocks/{symbol}/bars",
         headers={"APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY},
-        params={"timeframe": ALPACA_TIMEFRAME, "start": start, "limit": 500, "feed": "iex", "adjustment": "raw"},
+        params={"timeframe": ALPACA_TIMEFRAME, "start": start, "limit": limit, "feed": "iex", "adjustment": "raw"},
         timeout=15,
     )
     if r.status_code in (401, 403):
@@ -123,13 +123,12 @@ def fetch_candles(symbol):
     return {"c": [b["c"] for b in bars], "v": [b["v"] for b in bars]}
 
 
-def fetch_crypto_candles(symbol):
-    lookback_days = 14
+def fetch_crypto_candles(symbol, lookback_days=14, limit=500):
     start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get(
         "https://data.alpaca.markets/v1beta3/crypto/us/bars",
         headers={"APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY},
-        params={"symbols": symbol, "timeframe": ALPACA_TIMEFRAME, "start": start, "limit": 500},
+        params={"symbols": symbol, "timeframe": ALPACA_TIMEFRAME, "start": start, "limit": limit},
         timeout=15,
     )
     if r.status_code in (401, 403):
@@ -587,7 +586,49 @@ def analyze():
     save_memory(memory)
 
 
-def parse_verdict_direction(verdict_text):
+def backtest():
+    """One-off diagnostic, not part of the live pipeline: walks real
+    historical Alpaca bars through the exact same check_confluence() that
+    runs live, bar by bar, and reports how often it would have actually
+    fired. Set BACKTEST_SYMBOL and optionally BACKTEST_IS_CRYPTO=1."""
+    symbol = os.environ.get("BACKTEST_SYMBOL", "NVDA")
+    is_crypto = os.environ.get("BACKTEST_IS_CRYPTO") == "1"
+
+    if is_crypto:
+        candles = fetch_crypto_candles(symbol, lookback_days=60, limit=5000)
+    else:
+        candles = fetch_candles(symbol, lookback_days=60, limit=5000)
+
+    if not candles:
+        print(f"{symbol}: couldn't fetch data for backtest")
+        return
+
+    closes = candles["c"]
+    volumes = candles["v"]
+    total_bars = len(closes)
+    min_bars = EMA_LEN + WINDOW_BARS
+    if total_bars < min_bars:
+        print(f"{symbol}: only {total_bars} bars available, need at least {min_bars}, can't backtest meaningfully")
+        return
+
+    fires = []
+    for i in range(min_bars, total_bars + 1):
+        window = {"c": closes[:i], "v": volumes[:i]}
+        triggered, snapshot = check_confluence(window)
+        if triggered:
+            fires.append({"bar_index": i, "close": snapshot["close"]})
+
+    rate = len(fires) / (total_bars - min_bars + 1) * 100
+    print(f"{symbol} at {ALPACA_TIMEFRAME} resolution: {total_bars} bars checked, {len(fires)} would have triggered ({rate:.2f}% of eligible bars)")
+    if fires:
+        print("Most recent trigger points:")
+        for f in fires[-15:]:
+            print(f"  bar {f['bar_index']} of {total_bars}: close {f['close']}")
+    else:
+        print("Zero triggers across the whole window, either the setup is genuinely rare at this resolution, or the thresholds need loosening.")
+
+
+
     if not verdict_text:
         return None
     head = verdict_text.upper()[:60]
@@ -702,6 +743,8 @@ if __name__ == "__main__":
         analyze()
     elif mode == "postcheck":
         postcheck()
+    elif mode == "backtest":
+        backtest()
     else:
         print(f"Unknown mode: {mode}", file=sys.stderr)
         sys.exit(1)
