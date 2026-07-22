@@ -145,22 +145,12 @@ def fetch_crypto_candles(symbol, lookback_days=14, limit=500):
 def check_confluence(candles):
     closes = candles["c"]
     volumes = candles["v"]
-    if len(closes) < EMA_LEN + WINDOW_BARS:
+    if len(closes) < EMA_LEN + WINDOW_BARS + 1:  # +1 so there's a prior bar to compare against
         return False, {}
 
     ema50 = ema(closes, EMA_LEN)
     rsi14 = rsi(closes, RSI_LEN)
     vol_avg = sma(volumes, VOL_LEN)
-
-    def bars_since(cond_fn):
-        idx = len(closes) - 1
-        for back in range(WINDOW_BARS + 1):
-            i = idx - back
-            if i < 1:
-                break
-            if cond_fn(i):
-                return back
-        return None
 
     def price_cross(i):
         return closes[i - 1] <= ema50[i - 1] and closes[i] > ema50[i]
@@ -173,11 +163,28 @@ def check_confluence(candles):
     def vol_spike(i):
         return vol_avg[i] is not None and volumes[i] > vol_avg[i] * VOL_MULT
 
-    price_hit = bars_since(price_cross)
-    rsi_hit = bars_since(rsi_recovering)
-    vol_hit = bars_since(vol_spike)
+    def confluence_at(idx):
+        """Was confluence true looking back WINDOW_BARS from this bar?"""
+        def bars_since(cond_fn):
+            for back in range(WINDOW_BARS + 1):
+                i = idx - back
+                if i < 1:
+                    return None
+                if cond_fn(i):
+                    return back
+            return None
 
-    triggered = price_hit is not None and rsi_hit is not None and vol_hit is not None
+        return (
+            bars_since(price_cross) is not None
+            and bars_since(rsi_recovering) is not None
+            and bars_since(vol_spike) is not None
+        )
+
+    last_idx = len(closes) - 1
+    now_confluence = confluence_at(last_idx)
+    prev_confluence = confluence_at(last_idx - 1)
+    fresh_trigger = now_confluence and not prev_confluence  # only fire on the rising edge, not every bar it holds
+
     snapshot = {
         "close": closes[-1],
         "ema50": round(ema50[-1], 2),
@@ -185,7 +192,7 @@ def check_confluence(candles):
         "volume": volumes[-1],
         "vol_avg20": round(vol_avg[-1], 2) if vol_avg[-1] is not None else None,
     }
-    return triggered, snapshot
+    return fresh_trigger, snapshot
 
 
 # ── Context gathering (only runs in analyze mode) ───────────────────
