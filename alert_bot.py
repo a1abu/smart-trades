@@ -628,7 +628,7 @@ def backtest():
         print("Zero triggers across the whole window, either the setup is genuinely rare at this resolution, or the thresholds need loosening.")
 
 
-
+def parse_verdict_direction(verdict_text):
     if not verdict_text:
         return None
     head = verdict_text.upper()[:60]
