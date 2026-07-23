@@ -256,9 +256,13 @@ _SEC_HEADERS = {"User-Agent": "smart-trades-personal-bot contact@example.com"}
 def _get_cik(symbol):
     global _CIK_CACHE
     if _CIK_CACHE is None:
-        r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=_SEC_HEADERS, timeout=15)
-        r.raise_for_status()
-        _CIK_CACHE = {v["ticker"]: str(v["cik_str"]).zfill(10) for v in r.json().values()}
+        try:
+            r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=_SEC_HEADERS, timeout=15)
+            r.raise_for_status()
+            _CIK_CACHE = {v["ticker"]: str(v["cik_str"]).zfill(10) for v in r.json().values()}
+        except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+            print(f"Failed to fetch/parse SEC ticker list ({e}), SEC filings unavailable this run", file=sys.stderr)
+            _CIK_CACHE = {}
     return _CIK_CACHE.get(symbol)
 
 
@@ -321,8 +325,11 @@ def load_memory():
 
 
 def save_memory(memory):
-    with open(MEMORY_FILE, "w") as f:
-        json.dump(memory, f, indent=2)
+    try:
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(memory, f, indent=2)
+    except (IOError, OSError, TypeError) as e:
+        print(f"Failed to save memory.json ({e}), this run's memory update is lost but the alert already went out", file=sys.stderr)
 
 
 def situation_text(symbol, snapshot, fundamentals, news):
@@ -524,12 +531,15 @@ Make sure that the response is readable but still informative, NOT ONLY bullet p
 def send_alert(symbol, snapshot, verdict):
     title = f"{symbol} signal"
     body = verdict if verdict else f"Confluence fired but the AI council was unreachable.\n{json.dumps(snapshot)}"
-    requests.post(
-        f"https://ntfy.sh/{NTFY_TOPIC}",
-        data=body.encode("utf-8"),
-        headers={"Title": title},
-        timeout=15,
-    )
+    try:
+        requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=body.encode("utf-8"),
+            headers={"Title": title},
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as e:
+        print(f"{symbol}: ntfy delivery failed ({e}), verdict was computed but never reached your phone", file=sys.stderr)
 
 
 # ── Modes ────────────────────────────────────────────────────────────
