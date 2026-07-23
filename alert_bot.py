@@ -378,6 +378,20 @@ def add_to_memory(memory, symbol, text, verdict, close_at_alert, is_crypto):
 
 # ── AI council ───────────────────────────────────────────────────────
 
+def magnitude_label(pct):
+    if pct is None:
+        return ""
+    abs_pct = abs(pct)
+    if abs_pct < 1:
+        return "barely"
+    elif abs_pct < 3:
+        return "modestly"
+    elif abs_pct < 7:
+        return "solidly"
+    else:
+        return "sharply"
+
+
 def build_prompt(symbol, snapshot, fundamentals, news, similar_past=None, is_crypto=False):
     news_block = "\n".join(
         f"- {n.get('title', '?')}: {n.get('content', '')}" for n in news if "error" not in n
@@ -392,7 +406,8 @@ def build_prompt(symbol, snapshot, fundamentals, news, similar_past=None, is_cry
                 if not data.get("checked"):
                     continue
                 result = "CORRECT" if data.get("correct") else "WRONG" if data.get("correct") is False else "ungraded"
-                part = f"{h}: {result} ({data.get('pct_change')}%)"
+                pct = data.get("pct_change")
+                part = f"{h}: {result} ({magnitude_label(pct)} {pct:+.1f}%)" if pct is not None else f"{h}: {result}"
                 if data.get("reflection"):
                     part += f" [why: {data['reflection'][:150]}]"
                 graded_parts.append(part)
@@ -529,8 +544,10 @@ Make sure that the response is readable but still informative, NOT ONLY bullet p
 # ── Delivery ─────────────────────────────────────────────────────────
 
 def send_alert(symbol, snapshot, verdict):
-    title = f"{symbol} signal"
-    body = verdict if verdict else f"Confluence fired but the AI council was unreachable.\n{json.dumps(snapshot)}"
+    title = f"{symbol} {ALPACA_TIMEFRAME} signal"
+    fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    header = f"[{ALPACA_TIMEFRAME} chart, checked {fetched_at}, Alpaca free tier is ~15min delayed]\n\n"
+    body = header + (verdict if verdict else f"Confluence fired but the AI council was unreachable.\n{json.dumps(snapshot)}")
     try:
         requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
@@ -675,9 +692,13 @@ Original situation: {entry['text'][:600]}
 
 Verdict given: {entry['verdict'][:400]}
 
-Actual outcome at the {horizon_label} mark: price moved {pct_change:+.1f}%
+Actual outcome at the {horizon_label} mark: price moved {magnitude_label(pct_change)} ({pct_change:+.1f}%)
 since the alert, which means this verdict was wrong over that specific
-horizon (it may still be graded differently at other horizons).
+horizon (it may still be graded differently at other horizons). A barely
+wrong call and a sharply wrong call likely have different explanations,
+weigh that in your answer, a small miss might just be reasonable
+reasoning that landed on the wrong side of noise, a large one more
+likely means something material was missed.
 
 In 2-3 sentences, identify what in the original reasoning was likely
 mistaken or what information was probably missing, specific to this
