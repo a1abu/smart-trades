@@ -59,13 +59,34 @@ RAG_TOP_K = 3
 # long-term, or the reverse, one checkpoint conflates those.
 HORIZONS = {"3d": 3, "7d": 7, "14d": 14, "30d": 30, "60d": 60, "90d": 90}
 
-# Free-tagged OpenRouter model IDs drift over time. If a council member
-# starts erroring, check openrouter.ai/models for the current :free slug.
-OPENROUTER_MODELS = {
-    "OpenRouter / DeepSeek R1": "deepseek/deepseek-r1:free",
-    "OpenRouter / Qwen3": "qwen/qwen3-235b-a22b:free",
-    "OpenRouter / Gemma 3": "google/gemma-3-27b-it:free",
-}
+# Two independent teams, each Analyst and Reviewer gets the same base
+# context and does its own live search, reasoning entirely on its own,
+# no artificial role-splitting between them. Each team's Arbiter
+# reconciles its own Analyst+Reviewer. Reuse only ever happens *across*
+# teams, never within one, so each team's internal disagreement always
+# comes from two genuinely different models. No new API keys, everything
+# below sits on Groq or OpenRouter, both already connected.
+TEAMS = [
+    {
+        "label": "Team 1",
+        "analyst": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
+        "reviewer": {"name": "OpenRouter / Qwen3", "provider": "openrouter", "model": "qwen/qwen3-235b-a22b:free"},
+        "arbiter": {"name": "Groq / GPT-OSS-20B", "provider": "groq", "model": "openai/gpt-oss-20b"},
+    },
+    {
+        "label": "Team 2",
+        "analyst": {"name": "OpenRouter / Gemma 4 31B", "provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
+        "reviewer": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
+        "arbiter": {"name": "OpenRouter / Qwen3", "provider": "openrouter", "model": "qwen/qwen3-235b-a22b:free"},
+    },
+]
+# Reads both Arbiter rulings and verifies specific claims against live
+# search, runs before the Chief Arbiter, not after, so its corrections
+# can actually change the final verdict rather than just footnote it.
+FACT_CHECKER_MODEL = "openai/gpt-oss-120b"
+# Sees both Arbiter rulings and the fact-check report at the same time.
+CHIEF_ARBITER_MODEL = "openai/gpt-oss-120b"
+
 
 # ── Technical indicators ────────────────────────────────────────────
 
@@ -392,56 +413,80 @@ def magnitude_label(pct):
         return "sharply"
 
 
-def build_prompt(symbol, snapshot, fundamentals, news, similar_past=None, is_crypto=False):
-    news_block = "\n".join(
+def _build_news_block(news):
+    return "\n".join(
         f"- {n.get('title', '?')}: {n.get('content', '')}" for n in news if "error" not in n
     ) or "No recent news found."
 
-    if similar_past:
-        past_lines = []
-        for e in similar_past:
-            line = f"- {e['timestamp'][:10]}: {e['text'][:200]} -> verdict was: {e['verdict'][:150]}"
-            graded_parts = []
-            for h, data in (e.get("outcomes") or {}).items():
-                if not data.get("checked"):
-                    continue
-                result = "CORRECT" if data.get("correct") else "WRONG" if data.get("correct") is False else "ungraded"
-                pct = data.get("pct_change")
-                part = f"{h}: {result} ({magnitude_label(pct)} {pct:+.1f}%)" if pct is not None else f"{h}: {result}"
-                if data.get("reflection"):
-                    part += f" [why: {data['reflection'][:150]}]"
-                graded_parts.append(part)
-            if graded_parts:
-                line += " | GRADED OUTCOMES -> " + "; ".join(graded_parts)
-            past_lines.append(line)
-        past_block = "\n".join(past_lines)
-    else:
-        past_block = "No similar past situations in memory yet."
 
+def _build_past_block(similar_past):
+    if not similar_past:
+        return "No similar past situations in memory yet."
+    past_lines = []
+    for e in similar_past:
+        line = f"- {e['timestamp'][:10]}: {e['text'][:200]} -> verdict was: {e['verdict'][:150]}"
+        graded_parts = []
+        for h, data in (e.get("outcomes") or {}).items():
+            if not data.get("checked"):
+                continue
+            result = "CORRECT" if data.get("correct") else "WRONG" if data.get("correct") is False else "ungraded"
+            pct = data.get("pct_change")
+            part = f"{h}: {result} ({magnitude_label(pct)} {pct:+.1f}%)" if pct is not None else f"{h}: {result}"
+            if data.get("reflection"):
+                part += f" [why: {data['reflection'][:150]}]"
+            graded_parts.append(part)
+        if graded_parts:
+            line += " | GRADED OUTCOMES -> " + "; ".join(graded_parts)
+        past_lines.append(line)
+    return "\n".join(past_lines)
+
+
+def fetch_seat_search(symbol, is_crypto):
+    """Independent live search for one Analyst/Reviewer seat, separate
+    from the shared base news block, so each seat isn't just reading
+    the same pre-fetched text as every other seat. Free Tavily call,
+    not OpenRouter's :online plugin, which charges per result."""
+    query = symbol.replace("/USD", "") if is_crypto else symbol
+    try:
+        r = requests.post(
+            "https://api.tavily.com/search",
+            headers={"Authorization": f"Bearer {TAVILY_KEY}"},
+            json={"query": query, "topic": "news", "days": 3, "max_results": 5, "search_depth": "advanced"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        results = r.json().get("results", [])
+        return "\n".join(f"- {x['title']}: {x['content'][:300]}" for x in results) or "No independent search results found."
+    except Exception as e:
+        return f"(independent search unavailable: {e})"
+
+
+def build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search_block, is_crypto):
     if is_crypto:
-        weighting = """This is a crypto asset. Traditional fundamentals like P/E or debt
-ratios don't apply, ignore the fundamentals field below beyond its note.
-Weight recent news and market narrative most heavily instead."""
+        weighting = "This is a crypto asset, traditional fundamentals like P/E or debt ratios don't apply."
     else:
         weighting = "Your verdict should be driven primarily by the fundamentals and news below."
 
-    return f"""You are one of several independent analysts evaluating {symbol} for a
-long-only, halal-compliant trader. A technical signal fired, that's only a
-trigger to look, not evidence of anything on its own. {weighting}
+    return f"""You are one of two independent analysts evaluating {symbol} for a
+long-only, halal-compliant trader. You're reasoning entirely on your
+own, you have not seen and will not see anyone else's opinion on this.
+A technical signal fired, that's only a trigger to look, not evidence of
+anything on its own. {weighting}
 
-Technical snapshot (context only, weight this least): {json.dumps(snapshot)}
+Technical snapshot: {json.dumps(snapshot)}
 
 Fundamentals: {json.dumps(fundamentals)}
 
 Recent news, last 7 days:
 {news_block}
 
-Similar past situations from memory. GRADED OUTCOMES reflect what actually
-happened to the price at specific timeframes, that's real evidence, weigh
-it seriously, and note that a call can be graded differently at different
-horizons (right at 3 days, wrong at 30, or the reverse). Anything without
-a graded outcome yet is just this system's own past opinion, unverified,
-weight that the lightest of everything given:
+Your own independent live search, just performed:
+{own_search_block}
+
+Similar past situations from memory. GRADED OUTCOMES reflect what
+actually happened to the price, real evidence, weigh it seriously.
+Anything ungraded is just this system's own unverified past opinion,
+weigh that the lightest of everything given:
 {past_block}
 
 Do the following, in order:
@@ -469,12 +514,91 @@ number from the data.
 Keep the whole response between 50 and 250 words."""
 
 
-def call_groq(prompt, model="llama-3.3-70b-versatile"):
+def build_arbiter_prompt(symbol, team_label, analyst_opinion, reviewer_opinion):
+    return f"""You're the Arbiter for {team_label} evaluating {symbol}. Your Analyst
+and Reviewer each independently researched this and reasoned about it on
+their own, without seeing each other's work. Reconcile their two takes
+into one ruling for your team, don't just average them, weigh which
+one's argument is actually better supported by real evidence.
+
+Analyst's take:
+{analyst_opinion}
+
+Reviewer's take:
+{reviewer_opinion}
+
+Give, in order:
+1. Where they agree, and on what evidence.
+2. Where they disagree, and which side has the stronger evidence.
+3. Your team's ruling as the first line, exactly one word: BUY, HOLD, or SELL.
+4. 2-3 sentences explaining why, citing the specific evidence that
+decided it.
+
+Keep it under 200 words."""
+
+
+def build_factcheck_prompt(symbol, team1_ruling, team2_ruling):
+    return f"""Two independent teams reached rulings on {symbol}. Your job is
+verification, not opinion: check the specific factual claims in both
+rulings below against live search results. Flag anything incorrect,
+outdated, or unsupported, say specifically what's wrong and what's
+actually true instead. If everything checks out, say so plainly, don't
+invent a problem just to seem thorough.
+
+Team 1 ruling:
+{team1_ruling}
+
+Team 2 ruling:
+{team2_ruling}
+
+Search for whatever you need to verify the specific claims made above.
+Structure your response as a list of claims checked and their status.
+Keep it under 200 words."""
+
+
+def build_chief_arbiter_prompt(symbol, team1_ruling, team2_ruling, factcheck_report):
+    return f"""You're the Chief Arbiter for {symbol}, a long-only, halal-compliant
+trade alert. Two independent teams each reached their own ruling. A
+fact-checker independently verified both rulings against live search and
+reports what, if anything, was wrong, you're seeing that report at the
+same time as the two rulings, not after.
+
+Team 1 ruling:
+{team1_ruling}
+
+Team 2 ruling:
+{team2_ruling}
+
+Fact-check report:
+{factcheck_report}
+
+If the fact-checker flagged something as incorrect, that correction
+carries real weight, it's grounded in live verification, not another
+opinion. Don't just average the two team rulings, if the fact-check
+changes what's actually true, let it change your verdict.
+
+Give, in order:
+1. Where the two teams agreed or disagreed, and why.
+2. Whether the fact-check changes anything, and how.
+3. Final verdict as the first line, exactly one word: BUY, HOLD, or SELL.
+4. 2-3 sentences explaining the verdict, citing the specific evidence
+that tipped it.
+
+Make sure the response is readable but still informative, not only
+bullet points but not only pure text either."""
+
+
+def call_groq(prompt, model="openai/gpt-oss-120b", reasoning_effort=None, use_search=False):
+    payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.15}
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    if use_search:
+        payload["tools"] = [{"type": "browser_search"}]
     r = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_KEY}"},
-        json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0},
-        timeout=30,
+        json=payload,
+        timeout=45,
     )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
@@ -484,61 +608,70 @@ def call_openrouter(prompt, model):
     r = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-        json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0},
+        json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.15},
         timeout=30,
     )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
 
+def _call_member(member, prompt, use_search=False):
+    if member["provider"] == "groq":
+        return call_groq(prompt, model=member["model"], use_search=use_search)
+    return call_openrouter(prompt, member["model"])
+
+
 def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_crypto=False):
-    prompt = build_prompt(symbol, snapshot, fundamentals, news, similar_past=similar_past, is_crypto=is_crypto)
+    news_block = _build_news_block(news)
+    past_block = _build_past_block(similar_past)
 
-    opinions = {}
-    try:
-        opinions["Groq / Llama 3.3 70B"] = call_groq(prompt)
-    except Exception as e:
-        opinions["Groq / Llama 3.3 70B"] = f"(no response: {e})"
+    all_opinions = {}
+    team_rulings = {}
 
-    for name, model in OPENROUTER_MODELS.items():
+    for team in TEAMS:
+        member_opinions = {}
+        for role in ("analyst", "reviewer"):
+            member = team[role]
+            use_search = member["provider"] == "groq"
+            own_search = "(use your search tool for anything very recent)" if use_search else fetch_seat_search(symbol, is_crypto)
+            prompt = build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search, is_crypto)
+            try:
+                text = _call_member(member, prompt, use_search=use_search)
+            except Exception as e:
+                text = f"(no response: {e})"
+            member_opinions[role] = text
+            all_opinions[f"{team['label']} {role.capitalize()} ({member['name']})"] = text
+
+        arbiter = team["arbiter"]
+        arb_prompt = build_arbiter_prompt(symbol, team["label"], member_opinions["analyst"], member_opinions["reviewer"])
         try:
-            opinions[name] = call_openrouter(prompt, model)
+            ruling = _call_member(arbiter, arb_prompt, use_search=False)
         except Exception as e:
-            opinions[name] = f"(no response: {e})"
+            ruling = f"(arbiter failed: {e})"
+        team_rulings[team["label"]] = ruling
+        all_opinions[f"{team['label']} Arbiter ({arbiter['name']})"] = ruling
 
-    responded = {k: v for k, v in opinions.items() if not v.startswith("(no response")}
-    if not responded:
-        return None, opinions
+    responded_rulings = {k: v for k, v in team_rulings.items() if not v.startswith("(arbiter failed")}
+    if not responded_rulings:
+        return None, all_opinions
 
-    chairman_prompt = f"""Four analysts each did a bull case / bear case / verdict on
-{symbol}, independently and without seeing each other's work. Reconcile
-them into one final call, don't just tally votes.
+    t1 = team_rulings.get("Team 1", "(unavailable)")
+    t2 = team_rulings.get("Team 2", "(unavailable)")
 
-Weigh how strong each analyst's evidence actually was, not just what they
-concluded. A verdict backed by a specific number beats a verdict backed by
-vague reasoning, even if more analysts landed on the other side. A 3-1
-split doesn't automatically mean the 3 are right if the 1 dissenter cited
-a hard number the others ignored.
-
-Give, in order:
-1. Where the analysts genuinely agree, and on what evidence.
-2. Where they disagree, and which side has the stronger evidence.
-3. Final verdict as the first line, exactly one word: BUY, HOLD, or SELL.
-4. 2-3 sentences explaining the verdict, citing the specific evidence that
-tipped it, not just "most analysts agreed."
-
-Don't let "hold" absorb a genuine disagreement, if the evidence actually
-points a direction, say so even if the analysts split.
-
-Make sure that the response is readable but still informative, NOT ONLY bullet points but not only pure text either.
-
-{json.dumps(responded, indent=2)}"""
     try:
-        verdict = call_groq(chairman_prompt)
+        fc_prompt = build_factcheck_prompt(symbol, t1, t2)
+        factcheck_report = call_groq(fc_prompt, model=FACT_CHECKER_MODEL, use_search=True)
     except Exception as e:
-        verdict = f"Chairman failed ({e}), raw opinions:\n" + json.dumps(responded, indent=2)
+        factcheck_report = f"(fact-check unavailable: {e})"
+    all_opinions["Fact-checker (GPT-OSS-120B)"] = factcheck_report
 
-    return verdict, opinions
+    try:
+        chief_prompt = build_chief_arbiter_prompt(symbol, t1, t2, factcheck_report)
+        verdict = call_groq(chief_prompt, model=CHIEF_ARBITER_MODEL, reasoning_effort="high")
+    except Exception as e:
+        verdict = f"Chief Arbiter failed ({e}), team rulings:\n" + json.dumps(team_rulings, indent=2)
+
+    return verdict, all_opinions
 
 
 # ── Delivery ─────────────────────────────────────────────────────────
