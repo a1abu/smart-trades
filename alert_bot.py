@@ -21,6 +21,7 @@ or a dead council member still results in an alert, just a plainer one.
 import os
 import sys
 import json
+import time
 import requests
 from datetime import datetime, timezone, timedelta
 
@@ -70,14 +71,14 @@ TEAMS = [
     {
         "label": "Team 1",
         "analyst": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
-        "reviewer": {"name": "OpenRouter / Qwen3", "provider": "openrouter", "model": "qwen/qwen3-235b-a22b:free"},
+        "reviewer": {"name": "OpenRouter / Qwen3", "provider": "openrouter", "model": "qwen/qwen3-235b-a22b-07-25:free"},
         "arbiter": {"name": "Groq / GPT-OSS-20B", "provider": "groq", "model": "openai/gpt-oss-20b"},
     },
     {
         "label": "Team 2",
         "analyst": {"name": "OpenRouter / Gemma 4 31B", "provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
         "reviewer": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
-        "arbiter": {"name": "OpenRouter / Qwen3", "provider": "openrouter", "model": "qwen/qwen3-235b-a22b:free"},
+        "arbiter": {"name": "OpenRouter / Qwen3", "provider": "openrouter", "model": "qwen/qwen3-235b-a22b-07-25:free"},
     },
 ]
 # Reads both Arbiter rulings and verifies specific claims against live
@@ -85,7 +86,9 @@ TEAMS = [
 # can actually change the final verdict rather than just footnote it.
 FACT_CHECKER_MODEL = "openai/gpt-oss-120b"
 # Sees both Arbiter rulings and the fact-check report at the same time.
-CHIEF_ARBITER_MODEL = "openai/gpt-oss-120b"
+# Also used as Team 1's Analyst and Team 2's Reviewer, so it isn't fully
+# independent of what it's judging, accepted trade-off for raw capability.
+CHIEF_ARBITER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 
 # ── Technical indicators ────────────────────────────────────────────
@@ -588,31 +591,52 @@ Make sure the response is readable but still informative, not only
 bullet points but not only pure text either."""
 
 
-def call_groq(prompt, model="openai/gpt-oss-120b", reasoning_effort=None, use_search=False):
+def _sanity_check(content):
+    """A real answer is more than a few characters. Catches malformed or
+    truncated responses that return HTTP 200 but garbage content, so
+    that can't silently poison what an Arbiter or Chief Arbiter reads."""
+    if not content or len(content.strip()) < 20:
+        raise ValueError(f"suspiciously short/empty response: {content!r}")
+    return content
+
+
+def call_groq(prompt, model="openai/gpt-oss-120b", reasoning_effort=None, use_search=False, max_retries=3):
     payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.15}
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
     if use_search:
         payload["tools"] = [{"type": "browser_search"}]
-    r = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {GROQ_KEY}"},
-        json=payload,
-        timeout=45,
-    )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    for attempt in range(max_retries):
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}"},
+            json=payload,
+            timeout=45,
+        )
+        if r.status_code == 429 and attempt < max_retries - 1:
+            wait = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
+            print(f"Groq 429, waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return _sanity_check(r.json()["choices"][0]["message"]["content"])
 
 
-def call_openrouter(prompt, model):
-    r = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-        json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.15},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+def call_openrouter(prompt, model, max_retries=3):
+    for attempt in range(max_retries):
+        r = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+            json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.15},
+            timeout=30,
+        )
+        if r.status_code == 429 and attempt < max_retries - 1:
+            wait = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
+            print(f"OpenRouter 429, waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return _sanity_check(r.json()["choices"][0]["message"]["content"])
 
 
 def _call_member(member, prompt, use_search=False):
@@ -667,7 +691,7 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
 
     try:
         chief_prompt = build_chief_arbiter_prompt(symbol, t1, t2, factcheck_report)
-        verdict = call_groq(chief_prompt, model=CHIEF_ARBITER_MODEL, reasoning_effort="high")
+        verdict = call_openrouter(chief_prompt, CHIEF_ARBITER_MODEL)
     except Exception as e:
         verdict = f"Chief Arbiter failed ({e}), team rulings:\n" + json.dumps(team_rulings, indent=2)
 
@@ -730,7 +754,11 @@ def analyze():
     triggered_list = json.loads(os.environ.get("TRIGGERED", "[]"))
     memory = load_memory()
 
-    for item in triggered_list:
+    for i, item in enumerate(triggered_list):
+        if i > 0:
+            print("Pausing 20s between tickers to avoid bursting rate limits", file=sys.stderr)
+            time.sleep(20)
+
         symbol = item["symbol"]
         snapshot = item["snapshot"]
         is_crypto = item["is_crypto"]
