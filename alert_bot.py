@@ -642,13 +642,22 @@ def call_groq(prompt, model="openai/gpt-oss-120b", reasoning_effort=None, use_se
         payload["reasoning_effort"] = reasoning_effort
     if use_search:
         payload["tools"] = [{"type": "browser_search"}]
+    timeout = 75 if use_search else 45  # search calls take longer server-side
     for attempt in range(max_retries):
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            json=payload,
-            timeout=45,
-        )
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                json=payload,
+                timeout=timeout,
+            )
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                wait = 5 * (attempt + 1)
+                print(f"Groq request failed ({e}), waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise
         retryable = r.status_code == 429 or r.status_code >= 500
         if retryable and attempt < max_retries - 1:
             wait = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
@@ -661,12 +670,20 @@ def call_groq(prompt, model="openai/gpt-oss-120b", reasoning_effort=None, use_se
 
 def call_openrouter(prompt, model, max_retries=3):
     for attempt in range(max_retries):
-        r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-            json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.15},
-            timeout=30,
-        )
+        try:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+                json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.15},
+                timeout=30,
+            )
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                wait = 5 * (attempt + 1)
+                print(f"OpenRouter request failed ({e}), waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise
         retryable = r.status_code == 429 or r.status_code >= 500
         if retryable and attempt < max_retries - 1:
             wait = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
@@ -677,7 +694,13 @@ def call_openrouter(prompt, model, max_retries=3):
         return _sanity_check(r.json()["choices"][0]["message"]["content"])
 
 
-def _call_member(member, prompt, use_search=False):
+def _call_member(member, prompt, use_search=False, seen_models=None):
+    key = (member["provider"], member["model"])
+    if seen_models is not None:
+        if key in seen_models:
+            print(f"{member['name']}: already called earlier this run, pausing 10s to avoid a same-model rate-limit collision", file=sys.stderr)
+            time.sleep(10)
+        seen_models.add(key)
     if member["provider"] == "groq":
         return call_groq(prompt, model=member["model"], use_search=use_search)
     return call_openrouter(prompt, member["model"])
@@ -690,6 +713,7 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
 
     all_opinions = {}
     team_rulings = {}
+    seen_models = set()
 
     for team in TEAMS:
         member_opinions = {}
@@ -699,7 +723,7 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
             own_search = "(use your search tool for anything very recent)" if use_search else fetch_seat_search(symbol, is_crypto)
             prompt = build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search, macro_block, is_crypto)
             try:
-                text = _call_member(member, prompt, use_search=use_search)
+                text = _call_member(member, prompt, use_search=use_search, seen_models=seen_models)
             except Exception as e:
                 text = f"(no response: {e})"
             member_opinions[role] = text
@@ -708,7 +732,7 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
         arbiter = team["arbiter"]
         arb_prompt = build_arbiter_prompt(symbol, team["label"], member_opinions["analyst"], member_opinions["reviewer"])
         try:
-            ruling = _call_member(arbiter, arb_prompt, use_search=False)
+            ruling = _call_member(arbiter, arb_prompt, use_search=False, seen_models=seen_models)
         except Exception as e:
             ruling = f"(arbiter failed: {e})"
         team_rulings[team["label"]] = ruling
@@ -730,6 +754,10 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
 
     try:
         chief_prompt = build_chief_arbiter_prompt(symbol, t1, t2, factcheck_report)
+        chief_key = ("openrouter", CHIEF_ARBITER_MODEL)
+        if chief_key in seen_models:
+            print("Chief Arbiter model already called earlier this run, pausing 10s", file=sys.stderr)
+            time.sleep(10)
         verdict = call_openrouter(chief_prompt, CHIEF_ARBITER_MODEL)
     except Exception as e:
         verdict = f"Chief Arbiter failed ({e}), team rulings:\n" + json.dumps(team_rulings, indent=2)
