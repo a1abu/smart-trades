@@ -35,6 +35,7 @@ TAVILY_KEY = os.environ["TAVILY_API_KEY"]
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 ALPACA_KEY_ID = os.environ["ALPACA_KEY_ID"]
 ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
+FMP_KEY = os.environ["FMP_API_KEY"]
 
 # "5", "15", "60", or "D". Set per-workflow via the RESOLUTION env var.
 RESOLUTION = os.environ.get("RESOLUTION", "D")
@@ -222,9 +223,7 @@ def check_confluence(candles):
 
 # ── Context gathering (only runs in analyze mode) ───────────────────
 
-def fetch_fundamentals(symbol, is_crypto=False):
-    if is_crypto:
-        return {"note": "Traditional fundamentals (P/E, debt/equity) don't apply to crypto assets."}
+def fetch_finnhub_fundamentals(symbol):
     try:
         r = requests.get(
             "https://finnhub.io/api/v1/stock/metric",
@@ -240,7 +239,50 @@ def fetch_fundamentals(symbol, is_crypto=False):
             "52w_low": m.get("52WeekLow"),
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"Finnhub: {e}"}
+
+
+def fetch_fmp_ratios(symbol):
+    """Deeper ratio coverage than Finnhub's basic metrics: profitability,
+    liquidity, leverage, all trailing-twelve-month. Free tier, 250
+    calls/day, well within what this system needs."""
+    try:
+        r = requests.get(
+            f"https://financialmodelingprep.com/api/v3/ratios-ttm/{symbol}",
+            params={"apikey": FMP_KEY},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return {"error": "FMP: no data returned"}
+        m = data[0]
+        return {
+            "roe": m.get("returnOnEquityTTM"),
+            "current_ratio": m.get("currentRatioTTM"),
+            "quick_ratio": m.get("quickRatioTTM"),
+            "net_margin": m.get("netProfitMarginTTM"),
+            "gross_margin": m.get("grossProfitMarginTTM"),
+        }
+    except Exception as e:
+        return {"error": f"FMP: {e}"}
+
+
+def fetch_fundamentals(symbol, is_crypto=False):
+    if is_crypto:
+        return {"note": "Traditional fundamentals (P/E, debt/equity) don't apply to crypto assets."}
+    finnhub_data = fetch_finnhub_fundamentals(symbol)
+    fmp_data = fetch_fmp_ratios(symbol)
+    combined = {}
+    if "error" not in finnhub_data:
+        combined.update(finnhub_data)
+    else:
+        combined["finnhub_error"] = finnhub_data["error"]
+    if "error" not in fmp_data:
+        combined.update(fmp_data)
+    else:
+        combined["fmp_error"] = fmp_data["error"]
+    return combined
 
 
 def fetch_tavily_news(symbol):
@@ -274,54 +316,10 @@ def fetch_finnhub_news(symbol):
         return [{"error": f"Finnhub news: {e}"}]
 
 
-_CIK_CACHE = None
-_SEC_HEADERS = {"User-Agent": "smart-trades-personal-bot contact@example.com"}
-
-
-def _get_cik(symbol):
-    global _CIK_CACHE
-    if _CIK_CACHE is None:
-        try:
-            r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=_SEC_HEADERS, timeout=15)
-            r.raise_for_status()
-            _CIK_CACHE = {v["ticker"]: str(v["cik_str"]).zfill(10) for v in r.json().values()}
-        except (requests.exceptions.RequestException, ValueError, KeyError) as e:
-            print(f"Failed to fetch/parse SEC ticker list ({e}), SEC filings unavailable this run", file=sys.stderr)
-            _CIK_CACHE = {}
-    return _CIK_CACHE.get(symbol)
-
-
-def fetch_sec_filings(symbol):
-    try:
-        cik = _get_cik(symbol)
-        if not cik:
-            return []
-        r = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json", headers=_SEC_HEADERS, timeout=15)
-        r.raise_for_status()
-        recent = r.json().get("filings", {}).get("recent", {})
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).date()
-        cik_int = cik.lstrip("0")
-        out = []
-        for form, date_str, acc, doc in zip(
-            recent.get("form", []), recent.get("filingDate", []),
-            recent.get("accessionNumber", []), recent.get("primaryDocument", []),
-        ):
-            if form != "8-K":
-                continue
-            if datetime.strptime(date_str, "%Y-%m-%d").date() < cutoff:
-                continue
-            url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc.replace('-', '')}/{doc}"
-            out.append({"title": f"8-K filed {date_str}", "url": url, "content": "Material event disclosure, see filing."})
-        return out
-    except Exception as e:
-        return [{"error": f"SEC EDGAR: {e}"}]
-
-
 def fetch_news(symbol, is_crypto=False):
     combined = fetch_tavily_news(symbol)
     if not is_crypto:
         combined += fetch_finnhub_news(symbol)
-        combined += fetch_sec_filings(symbol)
     return combined
 
 
@@ -448,9 +446,13 @@ def _build_past_block(similar_past):
 def fetch_seat_search(symbol, is_crypto):
     """Independent live search for one Analyst/Reviewer seat, separate
     from the shared base news block, so each seat isn't just reading
-    the same pre-fetched text as every other seat. Free Tavily call,
-    not OpenRouter's :online plugin, which charges per result."""
-    query = symbol.replace("/USD", "") if is_crypto else symbol
+    the same pre-fetched text as every other seat. Query is broadened
+    to surface both company-specific and broader market-moving results
+    in one call, not a second API call, same Tavily usage as before.
+    Free Tavily call, not OpenRouter's :online plugin, which charges
+    per result."""
+    base = symbol.replace("/USD", "") if is_crypto else symbol
+    query = f"{base} stock news market impact" if not is_crypto else f"{base} crypto news market impact"
     try:
         r = requests.post(
             "https://api.tavily.com/search",
@@ -465,7 +467,32 @@ def fetch_seat_search(symbol, is_crypto):
         return f"(independent search unavailable: {e})"
 
 
-def build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search_block, is_crypto):
+def fetch_macro_context():
+    """Fetched once per cron cycle, not per ticker, since broad macro
+    conditions don't change ticker to ticker. GDELT for broad
+    geopolitical/macro event coverage, neither Tavily nor Finnhub are
+    built for that."""
+    parts = []
+
+    try:
+        r = requests.get(
+            "https://api.gdeltproject.org/api/v2/doc/doc",
+            params={
+                "query": "stock market OR federal reserve OR inflation OR interest rates",
+                "mode": "artlist", "maxrecords": 5, "format": "json", "sort": "datedesc",
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        for a in r.json().get("articles", [])[:5]:
+            parts.append(f"- {a.get('title', '?')} ({a.get('domain', '?')})")
+    except Exception as e:
+        parts.append(f"(GDELT unavailable: {e})")
+
+    return "\n".join(parts) if parts else "No macro context available."
+
+
+def build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search_block, macro_block, is_crypto):
     if is_crypto:
         weighting = "This is a crypto asset, traditional fundamentals like P/E or debt ratios don't apply."
     else:
@@ -487,6 +514,10 @@ Recent news, last 7 days:
 Your own independent live search, just performed:
 {own_search_block}
 
+Broader macro backdrop right now, current rates/inflation/employment
+data and general market-moving events, not specific to {symbol}:
+{macro_block}
+
 Similar past situations from memory. GRADED OUTCOMES reflect what
 actually happened to the price, real evidence, weigh it seriously.
 Anything ungraded is just this system's own unverified past opinion,
@@ -506,6 +537,10 @@ citing specific numbers or facts from the data above.
 hold, or sell.
 
 Rules:
+- Consider both the company-specific (micro) picture and the broader
+macro backdrop above, don't reason about {symbol} in isolation from the
+environment it's trading in, but don't force a macro angle in either if
+nothing above is actually relevant to it.
 - Every claim must trace to a specific number or fact given above. If the
 data doesn't support a claim, don't make it.
 - "Hold" is not a safe default. Only land on hold if the bull and bear
@@ -648,9 +683,10 @@ def _call_member(member, prompt, use_search=False):
     return call_openrouter(prompt, member["model"])
 
 
-def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_crypto=False):
+def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_crypto=False, macro_block=None):
     news_block = _build_news_block(news)
     past_block = _build_past_block(similar_past)
+    macro_block = macro_block or "No macro context available."
 
     all_opinions = {}
     team_rulings = {}
@@ -661,7 +697,7 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
             member = team[role]
             use_search = member["provider"] == "groq"
             own_search = "(use your search tool for anything very recent)" if use_search else fetch_seat_search(symbol, is_crypto)
-            prompt = build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search, is_crypto)
+            prompt = build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search, macro_block, is_crypto)
             try:
                 text = _call_member(member, prompt, use_search=use_search)
             except Exception as e:
@@ -757,6 +793,9 @@ def analyze():
     triggered_list = json.loads(os.environ.get("TRIGGERED", "[]"))
     memory = load_memory()
 
+    print("Fetching macro context (GDELT), once for this run")
+    macro_block = fetch_macro_context()
+
     for i, item in enumerate(triggered_list):
         if i > 0:
             print("Pausing 20s between tickers to avoid bursting rate limits", file=sys.stderr)
@@ -775,7 +814,7 @@ def analyze():
         similar_past = retrieve_similar(text, memory)
         print(f"{symbol}: found {len(similar_past)} similar past situations in memory")
 
-        verdict, opinions = run_council(symbol, snapshot, fundamentals, news, similar_past=similar_past, is_crypto=is_crypto)
+        verdict, opinions = run_council(symbol, snapshot, fundamentals, news, similar_past=similar_past, is_crypto=is_crypto, macro_block=macro_block)
         send_alert(symbol, snapshot, verdict)
 
         memory = add_to_memory(memory, symbol, text, verdict, snapshot.get("close"), is_crypto)
