@@ -23,6 +23,7 @@ import sys
 import json
 import time
 import requests
+import re
 from datetime import datetime, timezone, timedelta
 
 # ── Config ──────────────────────────────────────────────────────────
@@ -71,14 +72,14 @@ TEAMS = [
     {
         "label": "Team 1",
         "analyst": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
-        "reviewer": {"name": "OpenRouter / Qwen3", "provider": "openrouter", "model": "qwen/qwen3-235b-a22b-07-25:free"},
+        "reviewer": {"name": "OpenRouter / Gemma 4 31B", "provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
         "arbiter": {"name": "Groq / GPT-OSS-20B", "provider": "groq", "model": "openai/gpt-oss-20b"},
     },
     {
         "label": "Team 2",
         "analyst": {"name": "OpenRouter / Gemma 4 31B", "provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
         "reviewer": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
-        "arbiter": {"name": "OpenRouter / Qwen3", "provider": "openrouter", "model": "qwen/qwen3-235b-a22b-07-25:free"},
+        "arbiter": {"name": "Groq / GPT-OSS-120B", "provider": "groq", "model": "openai/gpt-oss-120b"},
     },
 ]
 # Reads both Arbiter rulings and verifies specific claims against live
@@ -613,9 +614,10 @@ def call_groq(prompt, model="openai/gpt-oss-120b", reasoning_effort=None, use_se
             json=payload,
             timeout=45,
         )
-        if r.status_code == 429 and attempt < max_retries - 1:
+        retryable = r.status_code == 429 or r.status_code >= 500
+        if retryable and attempt < max_retries - 1:
             wait = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
-            print(f"Groq 429, waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+            print(f"Groq {r.status_code}, waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
             time.sleep(wait)
             continue
         r.raise_for_status()
@@ -630,9 +632,10 @@ def call_openrouter(prompt, model, max_retries=3):
             json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.15},
             timeout=30,
         )
-        if r.status_code == 429 and attempt < max_retries - 1:
+        retryable = r.status_code == 429 or r.status_code >= 500
+        if retryable and attempt < max_retries - 1:
             wait = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
-            print(f"OpenRouter 429, waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+            print(f"OpenRouter {r.status_code}, waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
             time.sleep(wait)
             continue
         r.raise_for_status()
@@ -826,14 +829,14 @@ def backtest():
 def parse_verdict_direction(verdict_text):
     if not verdict_text:
         return None
-    head = verdict_text.upper()[:60]
-    if "BUY" in head:
-        return "BUY"
-    if "SELL" in head:
-        return "SELL"
-    if "HOLD" in head:
-        return "HOLD"
-    return None
+    matches = re.findall(r"\b(BUY|HOLD|SELL)\b", verdict_text)
+    if not matches:
+        return None
+    # Last match, not first: models don't always put the verdict on the
+    # literal first line despite being asked to, and earlier in the text
+    # they may be describing someone else's call (e.g. "Team 1's SELL
+    # call") before landing on a different final verdict themselves.
+    return matches[-1]
 
 
 def grade_verdict(direction, pct_change, hold_threshold=3.0):
