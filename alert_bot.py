@@ -29,7 +29,6 @@ from datetime import datetime, timezone, timedelta
 # ── Config ──────────────────────────────────────────────────────────
 
 FINNHUB_KEY = os.environ["FINNHUB_API_KEY"]
-GROQ_KEY = os.environ["GROQ_API_KEY"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
 TAVILY_KEY = os.environ["TAVILY_API_KEY"]
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
@@ -67,26 +66,26 @@ HORIZONS = {"3d": 3, "7d": 7, "14d": 14, "30d": 30, "60d": 60, "90d": 90}
 # no artificial role-splitting between them. Each team's Arbiter
 # reconciles its own Analyst+Reviewer. Reuse only ever happens *across*
 # teams, never within one, so each team's internal disagreement always
-# comes from two genuinely different models. No new API keys, everything
-# below sits on Groq or OpenRouter, both already connected.
+# comes from two genuinely different models. Groq was removed entirely
+# after repeated rate-limit failures, everything runs on OpenRouter now.
 TEAMS = [
     {
         "label": "Team 1",
         "analyst": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
         "reviewer": {"name": "OpenRouter / Gemma 4 31B", "provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
-        "arbiter": {"name": "Groq / GPT-OSS-20B", "provider": "groq", "model": "openai/gpt-oss-20b"},
+        "arbiter": {"name": "OpenRouter / auto-router", "provider": "openrouter", "model": "openrouter/free"},
     },
     {
         "label": "Team 2",
         "analyst": {"name": "OpenRouter / Gemma 4 31B", "provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
         "reviewer": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
-        "arbiter": {"name": "Groq / GPT-OSS-120B", "provider": "groq", "model": "openai/gpt-oss-120b"},
+        "arbiter": {"name": "OpenRouter / auto-router", "provider": "openrouter", "model": "openrouter/free"},
     },
 ]
 # Reads both Arbiter rulings and verifies specific claims against live
 # search, runs before the Chief Arbiter, not after, so its corrections
 # can actually change the final verdict rather than just footnote it.
-FACT_CHECKER_MODEL = "openai/gpt-oss-120b"
+FACT_CHECKER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 # Sees both Arbiter rulings and the fact-check report at the same time.
 # Also used as Team 1's Analyst and Team 2's Reviewer, so it isn't fully
 # independent of what it's judging, accepted trade-off for raw capability.
@@ -576,13 +575,13 @@ decided it.
 Keep it under 200 words."""
 
 
-def build_factcheck_prompt(symbol, team1_ruling, team2_ruling):
+def build_factcheck_prompt(symbol, team1_ruling, team2_ruling, search_block):
     return f"""Two independent teams reached rulings on {symbol}. Your job is
 verification, not opinion: check the specific factual claims in both
-rulings below against live search results. Flag anything incorrect,
-outdated, or unsupported, say specifically what's wrong and what's
-actually true instead. If everything checks out, say so plainly, don't
-invent a problem just to seem thorough.
+rulings below against the live search results provided. Flag anything
+incorrect, outdated, or unsupported, say specifically what's wrong and
+what's actually true instead. If everything checks out, say so plainly,
+don't invent a problem just to seem thorough.
 
 Team 1 ruling:
 {team1_ruling}
@@ -590,9 +589,13 @@ Team 1 ruling:
 Team 2 ruling:
 {team2_ruling}
 
-Search for whatever you need to verify the specific claims made above.
-Structure your response as a list of claims checked and their status.
-Keep it under 200 words."""
+Live search results to check the above against:
+{search_block}
+
+If the search results don't cover a specific claim, say that plainly
+rather than guessing, "unverifiable with what's available" is a
+legitimate finding. Structure your response as a list of claims checked
+and their status. Keep it under 200 words."""
 
 
 def build_chief_arbiter_prompt(symbol, team1_ruling, team2_ruling, factcheck_report):
@@ -624,7 +627,13 @@ Give, in order:
 that tipped it.
 
 Make sure the response is readable but still informative, not only
-bullet points but not only pure text either."""
+bullet points but not only pure text either.
+
+Style: this is the only text a person actually reads, on their phone,
+right now. Write plainly. Never use em dashes, use a period or comma
+instead. Skip AI-cliché phrasing entirely, no "in conclusion," no "it's
+worth noting," no "at the end of the day," no throat-clearing before
+the point. Say the thing directly."""
 
 
 def _sanity_check(content):
@@ -636,36 +645,7 @@ def _sanity_check(content):
     return content
 
 
-def call_groq(prompt, model="openai/gpt-oss-120b", reasoning_effort=None, use_search=False, max_retries=3):
-    payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.15}
-    if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
-    if use_search:
-        payload["tools"] = [{"type": "browser_search"}]
-    timeout = 75 if use_search else 45  # search calls take longer server-side
-    for attempt in range(max_retries):
-        try:
-            r = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                json=payload,
-                timeout=timeout,
-            )
-        except requests.exceptions.RequestException as e:
-            if attempt < max_retries - 1:
-                wait = 5 * (attempt + 1)
-                print(f"Groq request failed ({e}), waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
-                time.sleep(wait)
-                continue
-            raise
-        retryable = r.status_code == 429 or r.status_code >= 500
-        if retryable and attempt < max_retries - 1:
-            wait = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
-            print(f"Groq {r.status_code}, waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
-            time.sleep(wait)
-            continue
-        r.raise_for_status()
-        return _sanity_check(r.json()["choices"][0]["message"]["content"])
+MAX_RETRY_WAIT = 20  # seconds, hard cap regardless of what Retry-After says
 
 
 def call_openrouter(prompt, model, max_retries=3):
@@ -686,7 +666,11 @@ def call_openrouter(prompt, model, max_retries=3):
             raise
         retryable = r.status_code == 429 or r.status_code >= 500
         if retryable and attempt < max_retries - 1:
-            wait = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
+            raw_wait = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
+            if raw_wait > MAX_RETRY_WAIT:
+                print(f"OpenRouter {r.status_code} wants {raw_wait}s, over the {MAX_RETRY_WAIT}s cap, giving up now instead of blocking", file=sys.stderr)
+                r.raise_for_status()
+            wait = min(raw_wait, MAX_RETRY_WAIT)
             print(f"OpenRouter {r.status_code}, waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
             time.sleep(wait)
             continue
@@ -694,15 +678,13 @@ def call_openrouter(prompt, model, max_retries=3):
         return _sanity_check(r.json()["choices"][0]["message"]["content"])
 
 
-def _call_member(member, prompt, use_search=False, seen_models=None):
+def _call_member(member, prompt, seen_models=None):
     key = (member["provider"], member["model"])
     if seen_models is not None:
         if key in seen_models:
             print(f"{member['name']}: already called earlier this run, pausing 10s to avoid a same-model rate-limit collision", file=sys.stderr)
             time.sleep(10)
         seen_models.add(key)
-    if member["provider"] == "groq":
-        return call_groq(prompt, model=member["model"], use_search=use_search)
     return call_openrouter(prompt, member["model"])
 
 
@@ -719,11 +701,10 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
         member_opinions = {}
         for role in ("analyst", "reviewer"):
             member = team[role]
-            use_search = member["provider"] == "groq"
-            own_search = "(use your search tool for anything very recent)" if use_search else fetch_seat_search(symbol, is_crypto)
+            own_search = fetch_seat_search(symbol, is_crypto)
             prompt = build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search, macro_block, is_crypto)
             try:
-                text = _call_member(member, prompt, use_search=use_search, seen_models=seen_models)
+                text = _call_member(member, prompt, seen_models=seen_models)
             except Exception as e:
                 text = f"(no response: {e})"
             member_opinions[role] = text
@@ -732,7 +713,7 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
         arbiter = team["arbiter"]
         arb_prompt = build_arbiter_prompt(symbol, team["label"], member_opinions["analyst"], member_opinions["reviewer"])
         try:
-            ruling = _call_member(arbiter, arb_prompt, use_search=False, seen_models=seen_models)
+            ruling = _call_member(arbiter, arb_prompt, seen_models=seen_models)
         except Exception as e:
             ruling = f"(arbiter failed: {e})"
         team_rulings[team["label"]] = ruling
@@ -746,11 +727,17 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
     t2 = team_rulings.get("Team 2", "(unavailable)")
 
     try:
-        fc_prompt = build_factcheck_prompt(symbol, t1, t2)
-        factcheck_report = call_groq(fc_prompt, model=FACT_CHECKER_MODEL, use_search=True)
+        fc_search = fetch_seat_search(symbol, is_crypto)
+        fc_prompt = build_factcheck_prompt(symbol, t1, t2, fc_search)
+        fc_key = ("openrouter", FACT_CHECKER_MODEL)
+        if fc_key in seen_models:
+            print("Fact-checker model already called earlier this run, pausing 10s", file=sys.stderr)
+            time.sleep(10)
+        seen_models.add(fc_key)
+        factcheck_report = call_openrouter(fc_prompt, FACT_CHECKER_MODEL)
     except Exception as e:
         factcheck_report = f"(fact-check unavailable: {e})"
-    all_opinions["Fact-checker (GPT-OSS-120B)"] = factcheck_report
+    all_opinions["Fact-checker (Nemotron 3 Ultra)"] = factcheck_report
 
     try:
         chief_prompt = build_chief_arbiter_prompt(symbol, t1, t2, factcheck_report)
@@ -991,7 +978,7 @@ def postcheck():
 
             if correct is False:
                 try:
-                    slot["reflection"] = call_groq(build_reflection_prompt(entry, label, pct_change))[:500]
+                    slot["reflection"] = call_openrouter(build_reflection_prompt(entry, label, pct_change), FACT_CHECKER_MODEL)[:500]
                 except Exception as e:
                     print(f"{symbol}: reflection call failed ({e}) for {label}, grading without one", file=sys.stderr)
 
