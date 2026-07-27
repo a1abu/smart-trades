@@ -1,8 +1,6 @@
 name: Trade alert check (BTC, 15m)
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       force_trigger:
