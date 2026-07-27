@@ -1,4 +1,4 @@
-name: Trade alert check (15m)
+name: Trade alert check (BTC, 15m)
 
 on:
   workflow_dispatch:
@@ -25,6 +25,7 @@ jobs:
           echo "triggered=$result" >> "$GITHUB_OUTPUT"
         env:
           RESOLUTION: "15"
+          ASSET_CLASS: "crypto"
           FORCE_TRIGGER: ${{ github.event.inputs.force_trigger == 'true' && '1' || '0' }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
@@ -51,6 +52,7 @@ jobs:
         env:
           TRIGGERED: ${{ needs.check.outputs.triggered }}
           RESOLUTION: "15"
+          ASSET_CLASS: "crypto"
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENROUTER_API_KEY_2: ${{ secrets.OPENROUTER_API_KEY_2 }}
