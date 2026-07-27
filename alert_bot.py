@@ -30,6 +30,7 @@ from datetime import datetime, timezone, timedelta
 
 FINNHUB_KEY = os.environ["FINNHUB_API_KEY"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
+OPENROUTER_KEY_2 = os.environ["OPENROUTER_API_KEY_2"]
 TAVILY_KEY = os.environ["TAVILY_API_KEY"]
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 ALPACA_KEY_ID = os.environ["ALPACA_KEY_ID"]
@@ -71,25 +72,27 @@ HORIZONS = {"3d": 3, "7d": 7, "14d": 14, "30d": 30, "60d": 60, "90d": 90}
 TEAMS = [
     {
         "label": "Team 1",
-        "analyst": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
-        "reviewer": {"name": "OpenRouter / Gemma 4 31B", "provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
-        "arbiter": {"name": "OpenRouter / auto-router", "provider": "openrouter", "model": "openrouter/free"},
+        "analyst": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free", "key_id": "primary"},
+        "reviewer": {"name": "OpenRouter / Gemma 4 31B", "provider": "openrouter", "model": "google/gemma-4-31b-it:free", "key_id": "secondary"},
+        "arbiter": {"name": "OpenRouter / auto-router", "provider": "openrouter", "model": "openrouter/free", "key_id": "primary"},
     },
     {
         "label": "Team 2",
-        "analyst": {"name": "OpenRouter / Gemma 4 31B", "provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
-        "reviewer": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
-        "arbiter": {"name": "OpenRouter / auto-router", "provider": "openrouter", "model": "openrouter/free"},
+        "analyst": {"name": "OpenRouter / Gemma 4 31B", "provider": "openrouter", "model": "google/gemma-4-31b-it:free", "key_id": "secondary"},
+        "reviewer": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free", "key_id": "primary"},
+        "arbiter": {"name": "OpenRouter / auto-router", "provider": "openrouter", "model": "openrouter/free", "key_id": "secondary"},
     },
 ]
 # Reads both Arbiter rulings and verifies specific claims against live
 # search, runs before the Chief Arbiter, not after, so its corrections
 # can actually change the final verdict rather than just footnote it.
 FACT_CHECKER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+FACT_CHECKER_KEY = "secondary"
 # Sees both Arbiter rulings and the fact-check report at the same time.
 # Also used as Team 1's Analyst and Team 2's Reviewer, so it isn't fully
 # independent of what it's judging, accepted trade-off for raw capability.
 CHIEF_ARBITER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+CHIEF_ARBITER_KEY = "primary"
 
 
 # ── Technical indicators ────────────────────────────────────────────
@@ -648,12 +651,13 @@ def _sanity_check(content):
 MAX_RETRY_WAIT = 20  # seconds, hard cap regardless of what Retry-After says
 
 
-def call_openrouter(prompt, model, max_retries=3):
+def call_openrouter(prompt, model, key_id="primary", max_retries=3):
+    api_key = OPENROUTER_KEY_2 if key_id == "secondary" else OPENROUTER_KEY
     for attempt in range(max_retries):
         try:
             r = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+                headers={"Authorization": f"Bearer {api_key}"},
                 json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.15},
                 timeout=30,
             )
@@ -679,13 +683,14 @@ def call_openrouter(prompt, model, max_retries=3):
 
 
 def _call_member(member, prompt, seen_models=None):
-    key = (member["provider"], member["model"])
+    key_id = member.get("key_id", "primary")
+    dedup_key = (key_id, member["model"])
     if seen_models is not None:
-        if key in seen_models:
-            print(f"{member['name']}: already called earlier this run, pausing 10s to avoid a same-model rate-limit collision", file=sys.stderr)
+        if dedup_key in seen_models:
+            print(f"{member['name']}: already called on this key earlier this run, pausing 10s to avoid a same-model rate-limit collision", file=sys.stderr)
             time.sleep(10)
-        seen_models.add(key)
-    return call_openrouter(prompt, member["model"])
+        seen_models.add(dedup_key)
+    return call_openrouter(prompt, member["model"], key_id=key_id)
 
 
 def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_crypto=False, macro_block=None):
@@ -729,23 +734,23 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
     try:
         fc_search = fetch_seat_search(symbol, is_crypto)
         fc_prompt = build_factcheck_prompt(symbol, t1, t2, fc_search)
-        fc_key = ("openrouter", FACT_CHECKER_MODEL)
+        fc_key = (FACT_CHECKER_KEY, FACT_CHECKER_MODEL)
         if fc_key in seen_models:
-            print("Fact-checker model already called earlier this run, pausing 10s", file=sys.stderr)
+            print("Fact-checker model already called on this key earlier this run, pausing 10s", file=sys.stderr)
             time.sleep(10)
         seen_models.add(fc_key)
-        factcheck_report = call_openrouter(fc_prompt, FACT_CHECKER_MODEL)
+        factcheck_report = call_openrouter(fc_prompt, FACT_CHECKER_MODEL, key_id=FACT_CHECKER_KEY)
     except Exception as e:
         factcheck_report = f"(fact-check unavailable: {e})"
     all_opinions["Fact-checker (Nemotron 3 Ultra)"] = factcheck_report
 
     try:
         chief_prompt = build_chief_arbiter_prompt(symbol, t1, t2, factcheck_report)
-        chief_key = ("openrouter", CHIEF_ARBITER_MODEL)
+        chief_key = (CHIEF_ARBITER_KEY, CHIEF_ARBITER_MODEL)
         if chief_key in seen_models:
-            print("Chief Arbiter model already called earlier this run, pausing 10s", file=sys.stderr)
+            print("Chief Arbiter model already called on this key earlier this run, pausing 10s", file=sys.stderr)
             time.sleep(10)
-        verdict = call_openrouter(chief_prompt, CHIEF_ARBITER_MODEL)
+        verdict = call_openrouter(chief_prompt, CHIEF_ARBITER_MODEL, key_id=CHIEF_ARBITER_KEY)
     except Exception as e:
         verdict = f"Chief Arbiter failed ({e}), team rulings:\n" + json.dumps(team_rulings, indent=2)
 
