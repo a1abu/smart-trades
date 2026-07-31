@@ -43,7 +43,7 @@ ALPACA_TIMEFRAME = {"5": "5Min", "15": "15Min", "60": "1Hour", "D": "1Day"}[RESO
 
 # Halal-screened watchlist. Edit this yourself, nothing here gets
 # auto-added. Long-only, no leverage, no options, no shorting.
-TICKERS = ["NVDA", "AMD", "IAU"]
+TICKERS = ["AAPL", "AMD", "IAU"]
 CRYPTO_TICKERS = ["BTC/USD"]
 
 EMA_LEN = 50
@@ -526,33 +526,28 @@ Anything ungraded is just this system's own unverified past opinion,
 weigh that the lightest of everything given:
 {past_block}
 
-Do the following, in order:
-
-1. State the strongest case FOR buying, citing specific numbers or facts
-from the data above. If you can't find a genuinely strong case, say so
-rather than inventing one.
-
-2. State the strongest case AGAINST buying (for holding or selling),
-citing specific numbers or facts from the data above.
-
-3. Weigh the two cases against each other and give your verdict: buy,
-hold, or sell.
-
 Rules:
 - Consider both the company-specific (micro) picture and the broader
 macro backdrop above, don't reason about {symbol} in isolation from the
 environment it's trading in, but don't force a macro angle in either if
 nothing above is actually relevant to it.
 - Every claim must trace to a specific number or fact given above. If the
-data doesn't support a claim, don't make it.
+data doesn't support a claim, don't make it. If you can't find a
+genuinely strong case on one side, say so plainly rather than inventing
+one to fill the section.
 - "Hold" is not a safe default. Only land on hold if the bull and bear
 cases are genuinely close in strength, and say why. Don't pick it just to
 avoid committing to a read. THAT DOES NOT MEAN that you force a "Buy" or "Sell". You base your verdict on facts.
-- Don't invent facts not present in the data above.
 - Skip disclaimers and hedge phrases that aren't backed by a specific
 number from the data.
 
-Keep the whole response between 50 and 250 words."""
+Structure your answer exactly like this, one line per label, plain text
+after each colon, no markdown formatting:
+
+BULL CASE: [2-3 sentences, cite specific numbers]
+BEAR CASE: [2-3 sentences, cite specific numbers]
+VERDICT: [BUY, HOLD, or SELL, exactly one word]
+REASON: [1 sentence, the single fact that actually decided it]"""
 
 
 def build_arbiter_prompt(symbol, team_label, analyst_opinion, reviewer_opinion):
@@ -562,29 +557,30 @@ their own, without seeing each other's work. Reconcile their two takes
 into one ruling for your team, don't just average them, weigh which
 one's argument is actually better supported by real evidence.
 
+If BOTH the Analyst's and Reviewer's takes below are error messages or
+otherwise contain no real analysis, you have no basis for an opinion.
+Don't invent one. Rule HOLD and say plainly that neither input came
+through, that's a legitimate, honest ruling, not a failure to reconcile.
+
 Analyst's take:
 {analyst_opinion}
 
 Reviewer's take:
 {reviewer_opinion}
 
-Give, in order:
-1. Where they agree, and on what evidence.
-2. Where they disagree, and which side has the stronger evidence.
-3. Your team's ruling as the first line, exactly one word: BUY, HOLD, or SELL.
-4. 2-3 sentences explaining why, citing the specific evidence that
-decided it.
+Structure your answer exactly like this, one line per label, plain text
+after each colon, no markdown formatting:
 
-Keep it under 200 words."""
+AGREEMENT: [where they agree, and on what evidence, or "none, only one side responded" if that's the case]
+DISAGREEMENT: [where they disagree and which side has stronger evidence, or "n/a" if only one side responded]
+RULING: [BUY, HOLD, or SELL, exactly one word]
+REASON: [2-3 sentences, citing the specific evidence that decided it]"""
 
 
 def build_factcheck_prompt(symbol, team1_ruling, team2_ruling, search_block):
     return f"""Two independent teams reached rulings on {symbol}. Your job is
 verification, not opinion: check the specific factual claims in both
-rulings below against the live search results provided. Flag anything
-incorrect, outdated, or unsupported, say specifically what's wrong and
-what's actually true instead. If everything checks out, say so plainly,
-don't invent a problem just to seem thorough.
+rulings below against the live search results provided.
 
 Team 1 ruling:
 {team1_ruling}
@@ -595,18 +591,30 @@ Team 2 ruling:
 Live search results to check the above against:
 {search_block}
 
-If the search results don't cover a specific claim, say that plainly
-rather than guessing, "unverifiable with what's available" is a
-legitimate finding. Structure your response as a list of claims checked
-and their status. Keep it under 200 words."""
+For each specific, checkable claim (a number, a date, a named event),
+give one block in exactly this format, plain text, no markdown:
+
+CLAIM: [the specific claim, quoted or closely paraphrased]
+STATUS: [CONFIRMED, WRONG, or UNVERIFIABLE]
+CORRECTION: [if WRONG, what the search results actually show. If
+CONFIRMED or UNVERIFIABLE, write "n/a"]
+
+Use WRONG only when the search results actively contradict the claim.
+Use UNVERIFIABLE when the search results simply don't cover it, that is
+not the same thing as wrong, don't blur the two together. If a claim
+matches a different company or ticker than {symbol}, that's WRONG, not
+unverifiable, say so explicitly.
+
+Check at most the 5 most consequential claims, the ones the verdict
+actually leans on. Keep each block short."""
 
 
 def build_chief_arbiter_prompt(symbol, team1_ruling, team2_ruling, factcheck_report):
     return f"""You're the Chief Arbiter for {symbol}, a long-only, halal-compliant
 trade alert. Two independent teams each reached their own ruling. A
-fact-checker independently verified both rulings against live search and
-reports what, if anything, was wrong, you're seeing that report at the
-same time as the two rulings, not after.
+fact-checker independently verified specific claims from both rulings
+against live search, marking each one CONFIRMED, WRONG, or UNVERIFIABLE.
+You're seeing that report at the same time as the two rulings, not after.
 
 Team 1 ruling:
 {team1_ruling}
@@ -617,26 +625,30 @@ Team 2 ruling:
 Fact-check report:
 {factcheck_report}
 
-If the fact-checker flagged something as incorrect, that correction
-carries real weight, it's grounded in live verification, not another
-opinion. Don't just average the two team rulings, if the fact-check
-changes what's actually true, let it change your verdict.
+WRONG and UNVERIFIABLE are not the same thing, don't treat them alike.
+A claim marked WRONG carries real weight against whatever team made it,
+it's been actively contradicted by live search. A claim marked
+UNVERIFIABLE just means the search didn't cover it, that's neutral,
+not evidence against the team that made it. Don't punish a team for a
+claim search simply couldn't check.
 
-Give, in order:
-1. Where the two teams agreed or disagreed, and why.
-2. Whether the fact-check changes anything, and how.
-3. Final verdict as the first line, exactly one word: BUY, HOLD, or SELL.
-4. 2-3 sentences explaining the verdict, citing the specific evidence
-that tipped it.
+Don't just average the two team rulings. If a WRONG claim undercuts the
+core basis of a team's case, let that change your verdict.
 
-Make sure the response is readable but still informative, not only
-bullet points but not only pure text either.
+Structure your answer exactly like this, one line per label, plain text
+after each colon, no markdown formatting. VERDICT must be the very
+first line:
+
+VERDICT: [BUY, HOLD, or SELL, exactly one word]
+REASON: [2-3 sentences, citing the specific evidence that tipped it]
+TEAMS: [where the two teams agreed or disagreed, and why]
+FACT-CHECK: [what was CONFIRMED, WRONG, or UNVERIFIABLE, and whether it changed the verdict]
 
 Style: this is the only text a person actually reads, on their phone,
-right now. Write plainly. Never use em dashes, use a period or comma
-instead. Skip AI-cliché phrasing entirely, no "in conclusion," no "it's
-worth noting," no "at the end of the day," no throat-clearing before
-the point. Say the thing directly."""
+right now. Write plainly within each label. Never use em dashes, use a
+period or comma instead. Skip AI-cliché phrasing entirely, no "in
+conclusion," no "it's worth noting," no "at the end of the day," no
+throat-clearing before the point. Say the thing directly."""
 
 
 def _sanity_check(content):
@@ -777,14 +789,29 @@ def send_alert(symbol, snapshot, verdict):
 
 # ── Modes ────────────────────────────────────────────────────────────
 
+def is_market_hours():
+    """13:00-21:00 UTC, Monday-Friday, covers US market hours with some
+    padding either side. This is a hard gate inside the script itself,
+    independent of whatever external scheduler fired the job, so a
+    misconfigured or stray trigger can't cause off-hours checks."""
+    now = datetime.now(timezone.utc)
+    return now.weekday() < 5 and 13 <= now.hour < 21
+
+
 def check_only():
     """Cheap phase: candles + confluence check only. Prints a single-line
     JSON list to stdout, this is what the workflow captures as a job
     output, so nothing else may print to stdout in this mode."""
     asset_class = os.environ.get("ASSET_CLASS", "stocks")
     is_crypto = asset_class == "crypto"
-    symbols = CRYPTO_TICKERS if is_crypto else TICKERS
     force = os.environ.get("FORCE_TRIGGER") == "1"
+
+    if not is_crypto and not is_market_hours() and not force:
+        print("Outside market hours (13-21 UTC, Mon-Fri), skipping stock check regardless of what triggered this run", file=sys.stderr)
+        print(json.dumps([]))
+        return
+
+    symbols = CRYPTO_TICKERS if is_crypto else TICKERS
 
     results = []
     for symbol in symbols:
@@ -888,14 +915,16 @@ def backtest():
 def parse_verdict_direction(verdict_text):
     if not verdict_text:
         return None
-    matches = re.findall(r"\b(BUY|HOLD|SELL)\b", verdict_text)
-    if not matches:
-        return None
+    labeled = re.search(r"VERDICT:\s*(BUY|HOLD|SELL)\b", verdict_text, re.IGNORECASE)
+    if labeled:
+        return labeled.group(1).upper()
+    # Fallback for whenever a model doesn't follow the label exactly.
     # Last match, not first: models don't always put the verdict on the
     # literal first line despite being asked to, and earlier in the text
     # they may be describing someone else's call (e.g. "Team 1's SELL
     # call") before landing on a different final verdict themselves.
-    return matches[-1]
+    matches = re.findall(r"\b(BUY|HOLD|SELL)\b", verdict_text)
+    return matches[-1] if matches else None
 
 
 def grade_verdict(direction, pct_change, hold_threshold=3.0):
