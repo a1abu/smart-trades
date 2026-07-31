@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       force_trigger:
-        description: "Force full pipeline (ignore confluence check)"
+        description: "Force full pipeline for ALL tickers (ignore confluence check)"
         type: boolean
         default: false
+      force_tickers:
+        description: "Force full pipeline for specific ticker(s) only, comma-separated (e.g. AAPL,IAU), leave blank for none"
+        type: string
+        default: ""
 
 jobs:
   check:
@@ -27,6 +31,7 @@ jobs:
           RESOLUTION: "15"
           ASSET_CLASS: "crypto"
           FORCE_TRIGGER: ${{ github.event.inputs.force_trigger == 'true' && '1' || '0' }}
+          FORCE_TICKERS: ${{ github.event.inputs.force_tickers }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
