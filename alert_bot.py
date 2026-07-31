@@ -805,8 +805,11 @@ def check_only():
     asset_class = os.environ.get("ASSET_CLASS", "stocks")
     is_crypto = asset_class == "crypto"
     force = os.environ.get("FORCE_TRIGGER") == "1"
+    force_tickers = {
+        s.strip().upper() for s in os.environ.get("FORCE_TICKERS", "").split(",") if s.strip()
+    }
 
-    if not is_crypto and not is_market_hours() and not force:
+    if not is_crypto and not is_market_hours() and not force and not force_tickers:
         print("Outside market hours (13-21 UTC, Mon-Fri), skipping stock check regardless of what triggered this run", file=sys.stderr)
         print(json.dumps([]))
         return
@@ -821,8 +824,12 @@ def check_only():
                 print(f"{symbol}: no candle data, skipping", file=sys.stderr)
                 continue
             triggered, snapshot = check_confluence(candles)
+            symbol_key = symbol.replace("/USD", "") if is_crypto else symbol
             if force:
                 print(f"{symbol}: FORCE_TRIGGER set, forcing trigger", file=sys.stderr)
+                triggered = True
+            elif symbol_key in force_tickers or symbol in force_tickers:
+                print(f"{symbol}: in FORCE_TICKERS, forcing trigger", file=sys.stderr)
                 triggered = True
             if triggered:
                 results.append({"symbol": symbol, "snapshot": snapshot, "is_crypto": is_crypto})
