@@ -1,0 +1,25 @@
+name: Trade alert stats (verdict track record, manual only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  stats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python alert_bot.py stats
+        env:
+          RESOLUTION: "D"
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_API_KEY_2: ${{ secrets.OPENROUTER_API_KEY_2 }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
