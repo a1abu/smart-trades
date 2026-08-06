@@ -132,7 +132,7 @@ def sma(values, length):
 
 
 def fetch_candles(symbol, lookback_days=None, limit=500):
-    lookback_days = lookback_days if lookback_days is not None else (200 if RESOLUTION == "D" else 14)
+    lookback_days = lookback_days if lookback_days is not None else (300 if RESOLUTION == "D" else 14)
     start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get(
         f"https://data.alpaca.markets/v2/stocks/{symbol}/bars",
@@ -148,7 +148,7 @@ def fetch_candles(symbol, lookback_days=None, limit=500):
     if not bars:
         print(f"{symbol}: no bars returned for {ALPACA_TIMEFRAME}. Raw response: {r.text}", file=sys.stderr)
         return None
-    return {"c": [b["c"] for b in bars], "v": [b["v"] for b in bars]}
+    return {"c": [b["c"] for b in bars], "v": [b["v"] for b in bars], "h": [b["h"] for b in bars], "l": [b["l"] for b in bars]}
 
 
 def fetch_crypto_candles(symbol, lookback_days=14, limit=500):
@@ -167,7 +167,7 @@ def fetch_crypto_candles(symbol, lookback_days=14, limit=500):
     if not bars:
         print(f"{symbol}: no crypto bars returned for {ALPACA_TIMEFRAME}. Raw response: {r.text}", file=sys.stderr)
         return None
-    return {"c": [b["c"] for b in bars], "v": [b["v"] for b in bars]}
+    return {"c": [b["c"] for b in bars], "v": [b["v"] for b in bars], "h": [b["h"] for b in bars], "l": [b["l"] for b in bars]}
 
 
 def check_confluence(candles):
@@ -221,6 +221,46 @@ def check_confluence(candles):
         "vol_avg20": round(vol_avg[-1], 2) if vol_avg[-1] is not None else None,
     }
     return fresh_trigger, snapshot
+
+
+LONG_TREND_LEN = 200
+ATR_LEN = 14
+LEVELS_LEN = 20  # bars to look back for support/resistance
+
+
+def atr(highs, lows, closes, length):
+    if len(closes) < length + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+        trs.append(tr)
+    return sum(trs[-length:]) / length
+
+
+def compute_technical_context(symbol, is_crypto):
+    """Real, computed support/resistance, volatility, and longer-term
+    trend, not left for a model to guess at from a single close price.
+    Only called in analyze(), on a real trigger, not during the cheap
+    check phase, this is enrichment for the AI council, not part of the
+    confluence gate itself, which stays untouched."""
+    candles = fetch_crypto_candles(symbol) if is_crypto else fetch_candles(symbol)
+    if not candles or len(candles.get("c", [])) < LONG_TREND_LEN + 1:
+        return {"note": "not enough price history for extended technical context (support/resistance, ATR, long-term trend)"}
+
+    closes, highs, lows = candles["c"], candles["h"], candles["l"]
+    resistance = max(highs[-LEVELS_LEN:])
+    support = min(lows[-LEVELS_LEN:])
+    atr14 = atr(highs, lows, closes, ATR_LEN)
+    ema_long = ema(closes, LONG_TREND_LEN)[-1]
+
+    return {
+        "resistance": round(resistance, 2),
+        "support": round(support, 2),
+        f"atr{ATR_LEN}": round(atr14, 2) if atr14 is not None else None,
+        f"ema{LONG_TREND_LEN}": round(ema_long, 2),
+        "long_term_trend": f"above EMA{LONG_TREND_LEN}, longer-term uptrend context" if closes[-1] > ema_long else f"below EMA{LONG_TREND_LEN}, longer-term downtrend context",
+    }
 
 
 # ── Context gathering (only runs in analyze mode) ───────────────────
@@ -507,6 +547,10 @@ A technical signal fired, that's only a trigger to look, not evidence of
 anything on its own. {weighting}
 
 Technical snapshot: {json.dumps(snapshot)}
+(includes support/resistance from the last {LEVELS_LEN} bars, {ATR_LEN}-period
+ATR for volatility context, and the {LONG_TREND_LEN}-period EMA for
+longer-term trend, alongside the original close/EMA50/RSI/volume, when
+present, these are real computed levels, not estimates, use them)
 
 Fundamentals: {json.dumps(fundamentals)}
 
@@ -540,27 +584,40 @@ cases are genuinely close in strength, and say why. Don't pick it just to
 avoid committing to a read. THAT DOES NOT MEAN that you force a "Buy" or "Sell". You base your verdict on facts.
 - Skip disclaimers and hedge phrases that aren't backed by a specific
 number from the data.
+- A stock can be a good day-trade and a bad long-term hold at the same
+time, or the reverse. Give each timeframe its own honest verdict, don't
+default to repeating the same call four times unless the data genuinely
+supports that for all four.
 
 Structure your answer exactly like this, one line per label, plain text
 after each colon, no markdown formatting:
 
 BULL CASE: [2-3 sentences, cite specific numbers]
 BEAR CASE: [2-3 sentences, cite specific numbers]
-VERDICT: [BUY, HOLD, or SELL, exactly one word]
-REASON: [1 sentence, the single fact that actually decided it]"""
+DAY-TRADE: [BUY, HOLD, or SELL, exactly one word, next few hours to one day]
+SWING-TRADE: [BUY, HOLD, or SELL, exactly one word, next few days to about two weeks]
+SHORT-TERM: [BUY, HOLD, or SELL, exactly one word, next few weeks to about two months]
+LONG-TERM: [BUY, HOLD, or SELL, exactly one word, several months and beyond]
+REASON: [1 sentence, the single fact that most drove the SWING-TRADE call specifically]"""
 
 
 def build_arbiter_prompt(symbol, team_label, analyst_opinion, reviewer_opinion):
     return f"""You're the Arbiter for {team_label} evaluating {symbol}. Your Analyst
 and Reviewer each independently researched this and reasoned about it on
-their own, without seeing each other's work. Reconcile their two takes
-into one ruling for your team, don't just average them, weigh which
-one's argument is actually better supported by real evidence.
+their own, without seeing each other's work. Each gave a separate
+verdict for four timeframes, day-trade, swing-trade, short-term, and
+long-term, since a stock can genuinely be a good short-term trade and a
+bad long-term hold at once. Reconcile their two takes into one ruling
+per timeframe for your team, don't just average them, weigh which one's
+argument is actually better supported by real evidence, and do this
+independently for each timeframe, they don't all have to resolve the
+same way.
 
 If BOTH the Analyst's and Reviewer's takes below are error messages or
-otherwise contain no real analysis, you have no basis for an opinion.
-Don't invent one. Rule HOLD and say plainly that neither input came
-through, that's a legitimate, honest ruling, not a failure to reconcile.
+otherwise contain no real analysis, you have no basis for an opinion on
+any timeframe. Don't invent one. Rule HOLD across all four and say
+plainly that neither input came through, that's a legitimate, honest
+ruling, not a failure to reconcile.
 
 Analyst's take:
 {analyst_opinion}
@@ -572,9 +629,12 @@ Structure your answer exactly like this, one line per label, plain text
 after each colon, no markdown formatting:
 
 AGREEMENT: [where they agree, and on what evidence, or "none, only one side responded" if that's the case]
-DISAGREEMENT: [where they disagree and which side has stronger evidence, or "n/a" if only one side responded]
-RULING: [BUY, HOLD, or SELL, exactly one word]
-REASON: [2-3 sentences, citing the specific evidence that decided it]"""
+DISAGREEMENT: [where they disagree, which timeframes if it's not all of them, and which side has stronger evidence, or "n/a" if only one side responded]
+DAY-TRADE: [BUY, HOLD, or SELL, exactly one word]
+SWING-TRADE: [BUY, HOLD, or SELL, exactly one word]
+SHORT-TERM: [BUY, HOLD, or SELL, exactly one word]
+LONG-TERM: [BUY, HOLD, or SELL, exactly one word]
+REASON: [2-3 sentences, citing the specific evidence that decided the SWING-TRADE ruling specifically]"""
 
 
 def build_factcheck_prompt(symbol, team1_ruling, team2_ruling, search_block):
@@ -611,7 +671,8 @@ actually leans on. Keep each block short."""
 
 def build_chief_arbiter_prompt(symbol, team1_ruling, team2_ruling, factcheck_report):
     return f"""You're the Chief Arbiter for {symbol}, a long-only, halal-compliant
-trade alert. Two independent teams each reached their own ruling. A
+trade alert. Two independent teams each reached their own ruling across
+four timeframes, day-trade, swing-trade, short-term, and long-term. A
 fact-checker independently verified specific claims from both rulings
 against live search, marking each one CONFIRMED, WRONG, or UNVERIFIABLE.
 You're seeing that report at the same time as the two rulings, not after.
@@ -633,16 +694,21 @@ not evidence against the team that made it. Don't punish a team for a
 claim search simply couldn't check.
 
 Don't just average the two team rulings. If a WRONG claim undercuts the
-core basis of a team's case, let that change your verdict.
+core basis of a team's case for a given timeframe, let that change your
+verdict for that timeframe specifically, it doesn't have to change all
+four the same way.
 
 Structure your answer exactly like this, one line per label, plain text
-after each colon, no markdown formatting. VERDICT must be the very
-first line:
+after each colon, no markdown formatting. The four verdicts must come
+first, in this order:
 
-VERDICT: [BUY, HOLD, or SELL, exactly one word]
-REASON: [2-3 sentences, citing the specific evidence that tipped it]
+DAY-TRADE: [BUY, HOLD, or SELL, exactly one word]
+SWING-TRADE: [BUY, HOLD, or SELL, exactly one word]
+SHORT-TERM: [BUY, HOLD, or SELL, exactly one word]
+LONG-TERM: [BUY, HOLD, or SELL, exactly one word]
+REASON: [2-3 sentences, citing the specific evidence that tipped the SWING-TRADE call, and noting if another timeframe genuinely differs and why]
 TEAMS: [where the two teams agreed or disagreed, and why]
-FACT-CHECK: [what was CONFIRMED, WRONG, or UNVERIFIABLE, and whether it changed the verdict]
+FACT-CHECK: [what was CONFIRMED, WRONG, or UNVERIFIABLE, and whether it changed any of the four verdicts]
 
 Style: this is the only text a person actually reads, on their phone,
 right now. Write plainly within each label. Never use em dashes, use a
@@ -771,10 +837,14 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
 
 # ── Delivery ─────────────────────────────────────────────────────────
 
-def send_alert(symbol, snapshot, verdict):
+def send_alert(symbol, snapshot, verdict, halal_screened=True):
     title = f"{symbol} {ALPACA_TIMEFRAME} signal"
+    if not halal_screened:
+        title = f"[NOT HALAL-SCREENED] {title}"
     fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     header = f"[{ALPACA_TIMEFRAME} chart, checked {fetched_at}, Alpaca free tier is ~15min delayed]\n\n"
+    if not halal_screened:
+        header += f"WARNING: {symbol} is NOT on your halal-screened watchlist. This is a one-off forced check only, treat it as informational, not a vetted call.\n\n"
     body = header + (verdict if verdict else f"Confluence fired but the AI council was unreachable.\n{json.dumps(snapshot)}")
     try:
         requests.post(
@@ -814,7 +884,15 @@ def check_only():
         print(json.dumps([]))
         return
 
-    symbols = CRYPTO_TICKERS if is_crypto else TICKERS
+    watchlist = CRYPTO_TICKERS if is_crypto else TICKERS
+    symbols = list(watchlist)
+    if not is_crypto:
+        # One-off, this run only. Never written back to TICKERS itself,
+        # the next scheduled run only checks the real watchlist again.
+        extra = [s for s in force_tickers if s not in symbols]
+        if extra:
+            print(f"Adding {extra} for this run only, not halal-screened, not added to TICKERS", file=sys.stderr)
+        symbols += extra
 
     results = []
     for symbol in symbols:
@@ -825,14 +903,20 @@ def check_only():
                 continue
             triggered, snapshot = check_confluence(candles)
             symbol_key = symbol.replace("/USD", "") if is_crypto else symbol
+            is_extra = symbol not in watchlist
             if force:
                 print(f"{symbol}: FORCE_TRIGGER set, forcing trigger", file=sys.stderr)
                 triggered = True
-            elif symbol_key in force_tickers or symbol in force_tickers:
+            elif is_extra or symbol_key in force_tickers or symbol in force_tickers:
                 print(f"{symbol}: in FORCE_TICKERS, forcing trigger", file=sys.stderr)
                 triggered = True
             if triggered:
-                results.append({"symbol": symbol, "snapshot": snapshot, "is_crypto": is_crypto})
+                results.append({
+                    "symbol": symbol,
+                    "snapshot": snapshot,
+                    "is_crypto": is_crypto,
+                    "halal_screened": not is_extra,
+                })
             else:
                 print(f"{symbol}: no confluence this cycle", file=sys.stderr)
         except Exception as e:
@@ -858,8 +942,11 @@ def analyze():
         symbol = item["symbol"]
         snapshot = item["snapshot"]
         is_crypto = item["is_crypto"]
+        halal_screened = item.get("halal_screened", True)  # default True for older/manual payloads
 
         print(f"{symbol}: confluence triggered, gathering context")
+        tech_context = compute_technical_context(symbol, is_crypto)
+        snapshot = {**snapshot, **tech_context}
         fundamentals = fetch_fundamentals(symbol, is_crypto=is_crypto)
         news_query = symbol.replace("/USD", "") if is_crypto else symbol
         news = fetch_news(news_query, is_crypto=is_crypto)
@@ -869,7 +956,7 @@ def analyze():
         print(f"{symbol}: found {len(similar_past)} similar past situations in memory")
 
         verdict, opinions = run_council(symbol, snapshot, fundamentals, news, similar_past=similar_past, is_crypto=is_crypto, macro_block=macro_block)
-        send_alert(symbol, snapshot, verdict)
+        send_alert(symbol, snapshot, verdict, halal_screened=halal_screened)
 
         memory = add_to_memory(memory, symbol, text, verdict, snapshot.get("close"), is_crypto)
         print(f"{symbol}: alert sent")
@@ -919,17 +1006,87 @@ def backtest():
         print("Zero triggers across the whole window, either the setup is genuinely rare at this resolution, or the thresholds need loosening.")
 
 
+def stats():
+    """On-demand report of how the AI council's verdicts have actually
+    performed, aggregated from memory.json's already-graded outcomes.
+    Not a backtest against price data like backtest() is, this is a
+    backtest against the system's own real track record. Pure math over
+    what's already stored, no API calls, nothing new to fetch."""
+    memory = load_memory()
+    if not memory:
+        print("No entries in memory.json yet, nothing to report on.")
+        return
+
+    per_horizon = {h: {"correct": 0, "wrong": 0, "ungraded": 0, "not_due": 0} for h in HORIZONS}
+    per_ticker = {}
+    per_direction = {"BUY": {"correct": 0, "wrong": 0}, "SELL": {"correct": 0, "wrong": 0}, "HOLD": {"correct": 0, "wrong": 0}}
+
+    for entry in memory:
+        symbol = entry.get("symbol", "?")
+        per_ticker.setdefault(symbol, {h: {"correct": 0, "wrong": 0} for h in HORIZONS})
+        direction = parse_verdict_direction(entry.get("verdict"))
+        outcomes = entry.get("outcomes", {})
+
+        for h in HORIZONS:
+            data = outcomes.get(h, {})
+            if not data.get("checked"):
+                per_horizon[h]["not_due"] += 1
+                continue
+            correct = data.get("correct")
+            if correct is True:
+                per_horizon[h]["correct"] += 1
+                per_ticker[symbol][h]["correct"] += 1
+                if direction in per_direction:
+                    per_direction[direction]["correct"] += 1
+            elif correct is False:
+                per_horizon[h]["wrong"] += 1
+                per_ticker[symbol][h]["wrong"] += 1
+                if direction in per_direction:
+                    per_direction[direction]["wrong"] += 1
+            else:
+                per_horizon[h]["ungraded"] += 1
+
+    def rate_str(correct, wrong):
+        graded = correct + wrong
+        return f"{correct}/{graded} correct ({correct / graded * 100:.1f}%)" if graded else "no graded data yet"
+
+    print(f"Total entries in memory.json: {len(memory)}\n")
+
+    print("Win rate by horizon:")
+    for h in HORIZONS:
+        d = per_horizon[h]
+        print(f"  {h}: {rate_str(d['correct'], d['wrong'])}, {d['ungraded']} ungraded, {d['not_due']} not due yet")
+
+    print("\nWin rate by ticker:")
+    for symbol, horizons_data in per_ticker.items():
+        print(f"  {symbol}:")
+        for h in HORIZONS:
+            d = horizons_data[h]
+            if d["correct"] + d["wrong"] == 0:
+                continue
+            print(f"    {h}: {rate_str(d['correct'], d['wrong'])}")
+
+    print("\nWin rate by verdict direction (across all horizons):")
+    for direction, d in per_direction.items():
+        print(f"  {direction}: {rate_str(d['correct'], d['wrong'])}")
+
+
 def parse_verdict_direction(verdict_text):
+    """Grading is still built around single horizons (3d-90d), closest
+    match to that is the SWING-TRADE call, not day-trade or long-term,
+    so that's what gets graded. The other three timeframes are real
+    verdicts a person reads, just not the one compared against price
+    outcomes here, that would need a separate grading rework."""
     if not verdict_text:
         return None
-    labeled = re.search(r"VERDICT:\s*(BUY|HOLD|SELL)\b", verdict_text, re.IGNORECASE)
+    labeled = re.search(r"SWING-TRADE:\s*(BUY|HOLD|SELL)\b", verdict_text, re.IGNORECASE)
     if labeled:
         return labeled.group(1).upper()
-    # Fallback for whenever a model doesn't follow the label exactly.
-    # Last match, not first: models don't always put the verdict on the
-    # literal first line despite being asked to, and earlier in the text
-    # they may be describing someone else's call (e.g. "Team 1's SELL
-    # call") before landing on a different final verdict themselves.
+    # Fallback for whenever a model doesn't follow the label exactly, or
+    # for old memory entries from before the multi-timeframe format.
+    labeled_old = re.search(r"VERDICT:\s*(BUY|HOLD|SELL)\b", verdict_text, re.IGNORECASE)
+    if labeled_old:
+        return labeled_old.group(1).upper()
     matches = re.findall(r"\b(BUY|HOLD|SELL)\b", verdict_text)
     return matches[-1] if matches else None
 
@@ -1042,6 +1199,8 @@ if __name__ == "__main__":
         postcheck()
     elif mode == "backtest":
         backtest()
+    elif mode == "stats":
+        stats()
     else:
         print(f"Unknown mode: {mode}", file=sys.stderr)
         sys.exit(1)
