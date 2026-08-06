@@ -191,21 +191,21 @@ def check_confluence(candles):
     def vol_spike(i):
         return vol_avg[i] is not None and volumes[i] > vol_avg[i] * VOL_MULT
 
+    def bars_since_at(idx, cond_fn):
+        for back in range(WINDOW_BARS + 1):
+            i = idx - back
+            if i < 1:
+                return None
+            if cond_fn(i):
+                return back
+        return None
+
     def confluence_at(idx):
         """Was confluence true looking back WINDOW_BARS from this bar?"""
-        def bars_since(cond_fn):
-            for back in range(WINDOW_BARS + 1):
-                i = idx - back
-                if i < 1:
-                    return None
-                if cond_fn(i):
-                    return back
-            return None
-
         return (
-            bars_since(price_cross) is not None
-            and bars_since(rsi_recovering) is not None
-            and bars_since(vol_spike) is not None
+            bars_since_at(idx, price_cross) is not None
+            and bars_since_at(idx, rsi_recovering) is not None
+            and bars_since_at(idx, vol_spike) is not None
         )
 
     last_idx = len(closes) - 1
@@ -220,6 +220,19 @@ def check_confluence(candles):
         "volume": volumes[-1],
         "vol_avg20": round(vol_avg[-1], 2) if vol_avg[-1] is not None else None,
     }
+
+    if fresh_trigger:
+        price_ago = bars_since_at(last_idx, price_cross)
+        rsi_ago = bars_since_at(last_idx, rsi_recovering)
+        vol_ago = bars_since_at(last_idx, vol_spike)
+        snapshot["confluence_explanation"] = (
+            f"Price crossed above the {EMA_LEN}-bar EMA {price_ago} bar(s) ago. "
+            f"RSI recovered into the {RSI_FLOOR}-{RSI_CEIL} zone {rsi_ago} bar(s) ago, "
+            f"currently at {round(rsi14[last_idx], 2) if rsi14[last_idx] is not None else 'n/a'}. "
+            f"Volume spiked above {VOL_MULT}x its {VOL_LEN}-bar average {vol_ago} bar(s) ago, "
+            f"currently {volumes[last_idx]} vs a {round(vol_avg[last_idx], 0) if vol_avg[last_idx] is not None else 'n/a'} average."
+        )
+
     return fresh_trigger, snapshot
 
 
@@ -550,7 +563,10 @@ Technical snapshot: {json.dumps(snapshot)}
 (includes support/resistance from the last {LEVELS_LEN} bars, {ATR_LEN}-period
 ATR for volatility context, and the {LONG_TREND_LEN}-period EMA for
 longer-term trend, alongside the original close/EMA50/RSI/volume, when
-present, these are real computed levels, not estimates, use them)
+present, these are real computed levels, not estimates, use them. The
+"confluence_explanation" field states exactly why this alert fired,
+which of the three conditions triggered and how many bars ago, use it
+directly, don't guess at or restate this differently.)
 
 Fundamentals: {json.dumps(fundamentals)}
 
