@@ -549,9 +549,9 @@ def fetch_macro_context():
 
 def build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search_block, macro_block, is_crypto):
     if is_crypto:
-        weighting = "This is a crypto asset, traditional fundamentals like P/E or debt ratios don't apply."
+        weighting = "This is a crypto asset, traditional fundamentals like P/E or debt ratios don't apply. Weigh the technical picture and the news/macro backdrop together, genuinely together, neither one primary."
     else:
-        weighting = "Your verdict should be driven primarily by the fundamentals and news below."
+        weighting = "Weigh the technical picture and the fundamentals together, genuinely together. Neither is primary, neither is background."
 
     return f"""You are one of two independent analysts evaluating {symbol} for a
 long-only, halal-compliant trader. You're reasoning entirely on your
@@ -566,7 +566,9 @@ longer-term trend, alongside the original close/EMA50/RSI/volume, when
 present, these are real computed levels, not estimates, use them. The
 "confluence_explanation" field states exactly why this alert fired,
 which of the three conditions triggered and how many bars ago, use it
-directly, don't guess at or restate this differently.)
+directly, don't guess at or restate this differently. This explains why
+you're looking right now, it is not, on its own, more important than
+the fundamentals below.)
 
 Fundamentals: {json.dumps(fundamentals)}
 
@@ -587,6 +589,13 @@ weigh that the lightest of everything given:
 {past_block}
 
 Rules:
+- Every one of the four timeframe verdicts below must be grounded in
+BOTH the technical picture AND the fundamentals (or news/macro for
+crypto), not just one. A day-trade call reasoning purely on technicals
+while ignoring the fundamentals is incomplete, so is a long-term call
+that ignores the technical picture entirely. Don't let either side get
+crowded out at any single horizon, that includes day-trade and
+long-term specifically, not just the middle two.
 - Consider both the company-specific (micro) picture and the broader
 macro backdrop above, don't reason about {symbol} in isolation from the
 environment it's trading in, but don't force a macro angle in either if
@@ -608,13 +617,13 @@ supports that for all four.
 Structure your answer exactly like this, one line per label, plain text
 after each colon, no markdown formatting:
 
-BULL CASE: [2-3 sentences, cite specific numbers]
-BEAR CASE: [2-3 sentences, cite specific numbers]
+BULL CASE: [2-3 sentences, must cite at least one technical fact AND one fundamental fact, not just one side]
+BEAR CASE: [2-3 sentences, must cite at least one technical fact AND one fundamental fact, not just one side]
 DAY-TRADE: [BUY, HOLD, or SELL, exactly one word, next few hours to one day]
 SWING-TRADE: [BUY, HOLD, or SELL, exactly one word, next few days to about two weeks]
 SHORT-TERM: [BUY, HOLD, or SELL, exactly one word, next few weeks to about two months]
 LONG-TERM: [BUY, HOLD, or SELL, exactly one word, several months and beyond]
-REASON: [1 sentence, the single fact that most drove the SWING-TRADE call specifically]"""
+REASON: [1-2 sentences, combining the technical and fundamental fact that most drove the SWING-TRADE call specifically]"""
 
 
 def build_arbiter_prompt(symbol, team_label, analyst_opinion, reviewer_opinion):
