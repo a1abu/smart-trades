@@ -31,6 +31,11 @@ from datetime import datetime, timezone, timedelta
 FINNHUB_KEY = os.environ["FINNHUB_API_KEY"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_KEY_2 = os.environ["OPENROUTER_API_KEY_2"]
+# Fallback only, never a primary provider. Every seat's model/provider/
+# weight config is untouched, this only fires when a seat's normal call
+# has already failed and exhausted its own retries.
+NVIDIA_KEY = os.environ["NVIDIA_API_KEY"]
+NVIDIA_FALLBACK_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
 TAVILY_KEY = os.environ["TAVILY_API_KEY"]
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 ALPACA_KEY_ID = os.environ["ALPACA_KEY_ID"]
@@ -785,6 +790,55 @@ def call_openrouter(prompt, model, key_id="primary", max_retries=3):
         return _sanity_check(r.json()["choices"][0]["message"]["content"])
 
 
+def call_nvidia(prompt, model=NVIDIA_FALLBACK_MODEL, max_retries=3):
+    """Fallback only, called from call_with_fallback when the normal
+    OpenRouter call already failed. Never called directly as a seat's
+    primary provider."""
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(
+                "https://integrate.api.nvidia.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {NVIDIA_KEY}"},
+                json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.15},
+                timeout=30,
+            )
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                wait = 5 * (attempt + 1)
+                print(f"NVIDIA fallback request failed ({e}), waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise
+        retryable = r.status_code == 429 or r.status_code >= 500
+        if retryable and attempt < max_retries - 1:
+            raw_wait = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
+            if raw_wait > MAX_RETRY_WAIT:
+                print(f"NVIDIA fallback {r.status_code} wants {raw_wait}s, over the {MAX_RETRY_WAIT}s cap, giving up now instead of blocking", file=sys.stderr)
+                r.raise_for_status()
+            wait = min(raw_wait, MAX_RETRY_WAIT)
+            print(f"NVIDIA fallback {r.status_code}, waiting {wait}s (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return _sanity_check(r.json()["choices"][0]["message"]["content"])
+
+
+def call_with_fallback(prompt, model, key_id="primary", role_name="seat"):
+    """Every seat goes through this now, not call_openrouter directly.
+    Tries the seat's own normal call first, exactly as configured,
+    unchanged. Only if that fails entirely, all of call_openrouter's own
+    retries exhausted, does this reach for NVIDIA once as a last resort,
+    so a role still gets an answer for this run instead of coming back
+    empty. If NVIDIA also fails, the exception propagates up exactly as
+    before, the existing fail-open handling at each call site is
+    untouched."""
+    try:
+        return call_openrouter(prompt, model, key_id=key_id)
+    except Exception as e:
+        print(f"{role_name}: primary call failed ({e}), falling back to NVIDIA", file=sys.stderr)
+        return call_nvidia(prompt)
+
+
 def _call_member(member, prompt, seen_models=None):
     key_id = member.get("key_id", "primary")
     dedup_key = (key_id, member["model"])
@@ -793,7 +847,7 @@ def _call_member(member, prompt, seen_models=None):
             print(f"{member['name']}: already called on this key earlier this run, pausing 10s to avoid a same-model rate-limit collision", file=sys.stderr)
             time.sleep(10)
         seen_models.add(dedup_key)
-    return call_openrouter(prompt, member["model"], key_id=key_id)
+    return call_with_fallback(prompt, member["model"], key_id=key_id, role_name=member["name"])
 
 
 def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_crypto=False, macro_block=None):
@@ -842,7 +896,7 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
             print("Fact-checker model already called on this key earlier this run, pausing 10s", file=sys.stderr)
             time.sleep(10)
         seen_models.add(fc_key)
-        factcheck_report = call_openrouter(fc_prompt, FACT_CHECKER_MODEL, key_id=FACT_CHECKER_KEY)
+        factcheck_report = call_with_fallback(fc_prompt, FACT_CHECKER_MODEL, key_id=FACT_CHECKER_KEY, role_name="Fact-checker")
     except Exception as e:
         factcheck_report = f"(fact-check unavailable: {e})"
     all_opinions["Fact-checker (Nemotron 3 Ultra)"] = factcheck_report
@@ -853,7 +907,7 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
         if chief_key in seen_models:
             print("Chief Arbiter model already called on this key earlier this run, pausing 10s", file=sys.stderr)
             time.sleep(10)
-        verdict = call_openrouter(chief_prompt, CHIEF_ARBITER_MODEL, key_id=CHIEF_ARBITER_KEY)
+        verdict = call_with_fallback(chief_prompt, CHIEF_ARBITER_MODEL, key_id=CHIEF_ARBITER_KEY, role_name="Chief Arbiter")
     except Exception as e:
         verdict = f"Chief Arbiter failed ({e}), team rulings:\n" + json.dumps(team_rulings, indent=2)
 
@@ -1201,7 +1255,7 @@ def postcheck():
 
             if correct is False:
                 try:
-                    slot["reflection"] = call_openrouter(build_reflection_prompt(entry, label, pct_change), FACT_CHECKER_MODEL)[:500]
+                    slot["reflection"] = call_with_fallback(build_reflection_prompt(entry, label, pct_change), FACT_CHECKER_MODEL, role_name="Reflection")[:500]
                 except Exception as e:
                     print(f"{symbol}: reflection call failed ({e}) for {label}, grading without one", file=sys.stderr)
 
