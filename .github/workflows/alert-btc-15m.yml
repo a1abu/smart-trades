@@ -1,4 +1,4 @@
-name: Trade alert check (BTC, 15m)
+name: Trade alert check (Crypto, 15m)
 
 on:
   workflow_dispatch:
