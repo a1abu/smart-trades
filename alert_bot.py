@@ -51,7 +51,7 @@ ALPACA_TIMEFRAME = {"5": "5Min", "15": "15Min", "60": "1Hour", "D": "1Day"}[RESO
 TICKERS = ["AAPL", "AMD", "IAU"]
 CRYPTO_TICKERS = [
     {"symbol": "BTC/USD", "source": "alpaca", "display": "BTC"},
-    {"symbol": "BINANCE:PAXGUSDT", "source": "finnhub", "display": "PAXG"},
+    {"symbol": "PAXGUSD", "source": "kraken", "display": "PAXG"},
 ]
 
 EMA_LEN = 50
@@ -178,35 +178,50 @@ def fetch_crypto_candles(symbol, lookback_days=14, limit=500):
     return {"c": [b["c"] for b in bars], "v": [b["v"] for b in bars], "h": [b["h"] for b in bars], "l": [b["l"] for b in bars]}
 
 
-def fetch_finnhub_crypto_candles(symbol, lookback_days=14):
-    """For crypto tickers Alpaca doesn't carry, PAXG specifically. Same
+KRAKEN_INTERVAL_MAP = {"5": 5, "15": 15, "60": 60, "D": 1440}
+
+
+def fetch_kraken_candles(pair, lookback_days=None):
+    """For crypto tickers Alpaca doesn't carry, PAXG specifically.
+    Kraken's public OHLC endpoint, genuinely free, no key at all. Same
     output shape as fetch_crypto_candles so it's a drop-in for anything
-    that already consumes that dict. Finnhub's resolution values (1, 5,
-    15, 30, 60, D, W, M) match our own RESOLUTION env var directly, no
-    translation needed."""
-    end_ts = int(datetime.now(timezone.utc).timestamp())
-    start_ts = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp())
+    that already consumes that dict. Real limitation, not a bug: this
+    endpoint caps out around 720 bars per request regardless of how far
+    back you ask, fine for live confluence checking, shallow for deep
+    backtesting."""
+    interval = KRAKEN_INTERVAL_MAP.get(RESOLUTION, 15)
     r = requests.get(
-        "https://finnhub.io/api/v1/crypto/candle",
-        params={"symbol": symbol, "resolution": RESOLUTION, "from": start_ts, "to": end_ts, "token": FINNHUB_KEY},
+        "https://api.kraken.com/0/public/OHLC",
+        params={"pair": pair, "interval": interval},
         timeout=15,
     )
-    if r.status_code in (401, 403):
-        print(f"{symbol}: {r.status_code} from Finnhub crypto, check FINNHUB_API_KEY. Raw response: {r.text}", file=sys.stderr)
-        return None
     r.raise_for_status()
     data = r.json()
-    if data.get("s") != "ok" or not data.get("c"):
-        print(f"{symbol}: no Finnhub crypto candles returned for resolution {RESOLUTION}. Raw response: {r.text}", file=sys.stderr)
+    if data.get("error"):
+        print(f"{pair}: Kraken returned an error: {data['error']}", file=sys.stderr)
         return None
-    return {"c": data["c"], "v": data["v"], "h": data["h"], "l": data["l"]}
+    result = data.get("result", {})
+    # Kraken echoes the pair back under its own internal name, which can
+    # differ slightly from what was requested, so just take whichever
+    # key isn't "last".
+    rows = next((v for k, v in result.items() if k != "last"), None)
+    if not rows:
+        print(f"{pair}: no Kraken OHLC rows returned. Raw response: {r.text}", file=sys.stderr)
+        return None
+    # [time, open, high, low, close, vwap, volume, count]
+    return {
+        "c": [float(row[4]) for row in rows],
+        "h": [float(row[2]) for row in rows],
+        "l": [float(row[3]) for row in rows],
+        "v": [float(row[6]) for row in rows],
+    }
 
 
 def fetch_crypto_by_source(ticker, lookback_days=14):
     """Dispatches to the right provider for a crypto ticker, since not
     every crypto asset is on Alpaca, PAXG specifically isn't."""
-    if ticker["source"] == "finnhub":
-        return fetch_finnhub_crypto_candles(ticker["symbol"], lookback_days=lookback_days)
+    if ticker["source"] == "kraken":
+        return fetch_kraken_candles(ticker["symbol"])
     return fetch_crypto_candles(ticker["symbol"], lookback_days=lookback_days)
 
 
@@ -298,7 +313,7 @@ def compute_technical_context(fetch_symbol, is_crypto, source="alpaca"):
     check phase, this is enrichment for the AI council, not part of the
     confluence gate itself, which stays untouched."""
     if is_crypto:
-        candles = fetch_finnhub_crypto_candles(fetch_symbol) if source == "finnhub" else fetch_crypto_candles(fetch_symbol)
+        candles = fetch_kraken_candles(fetch_symbol) if source == "kraken" else fetch_crypto_candles(fetch_symbol)
     else:
         candles = fetch_candles(fetch_symbol)
     if not candles or len(candles.get("c", [])) < LONG_TREND_LEN + 1:
@@ -1115,13 +1130,13 @@ def backtest():
     historical bars through the exact same check_confluence() that runs
     live, bar by bar, and reports how often it would have actually
     fired. Set BACKTEST_SYMBOL and optionally BACKTEST_IS_CRYPTO=1 and
-    BACKTEST_SOURCE=finnhub for tickers not on Alpaca, PAXG specifically."""
+    BACKTEST_SOURCE=kraken for tickers not on Alpaca, PAXG specifically."""
     symbol = os.environ.get("BACKTEST_SYMBOL", "NVDA")
     is_crypto = os.environ.get("BACKTEST_IS_CRYPTO") == "1"
     source = os.environ.get("BACKTEST_SOURCE", "alpaca")
 
     if is_crypto:
-        candles = fetch_finnhub_crypto_candles(symbol, lookback_days=60) if source == "finnhub" else fetch_crypto_candles(symbol, lookback_days=60, limit=5000)
+        candles = fetch_kraken_candles(symbol) if source == "kraken" else fetch_crypto_candles(symbol, lookback_days=60, limit=5000)
     else:
         candles = fetch_candles(symbol, lookback_days=60, limit=5000)
 
@@ -1285,7 +1300,7 @@ def postcheck():
     def current_price(symbol, fetch_symbol, is_crypto, source="alpaca"):
         if symbol not in price_cache:
             if is_crypto:
-                candles = fetch_finnhub_crypto_candles(fetch_symbol) if source == "finnhub" else fetch_crypto_candles(fetch_symbol)
+                candles = fetch_kraken_candles(fetch_symbol) if source == "kraken" else fetch_crypto_candles(fetch_symbol)
             else:
                 candles = fetch_candles(fetch_symbol)
             price_cache[symbol] = candles["c"][-1] if candles else None
