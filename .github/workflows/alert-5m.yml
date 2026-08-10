@@ -8,7 +8,7 @@ on:
         type: boolean
         default: false
       force_tickers:
-        description: "Force full pipeline for specific ticker(s) only, comma-separated (e.g. AAPL,IAU), leave blank for none"
+        description: "Watchlist: Apple (AAPL), Advanced Micro Devices (AMD), iShares Gold Trust (IAU). Comma-separated, other US tickers also work for a one-off check. Leave blank for none."
         type: string
         default: ""
 
