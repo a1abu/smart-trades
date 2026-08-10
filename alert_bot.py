@@ -49,7 +49,10 @@ ALPACA_TIMEFRAME = {"5": "5Min", "15": "15Min", "60": "1Hour", "D": "1Day"}[RESO
 # Halal-screened watchlist. Edit this yourself, nothing here gets
 # auto-added. Long-only, no leverage, no options, no shorting.
 TICKERS = ["AAPL", "AMD", "IAU"]
-CRYPTO_TICKERS = ["BTC/USD"]
+CRYPTO_TICKERS = [
+    {"symbol": "BTC/USD", "source": "alpaca", "display": "BTC"},
+    {"symbol": "BINANCE:PAXGUSDT", "source": "finnhub", "display": "PAXG"},
+]
 
 EMA_LEN = 50
 RSI_LEN = 14
@@ -175,6 +178,38 @@ def fetch_crypto_candles(symbol, lookback_days=14, limit=500):
     return {"c": [b["c"] for b in bars], "v": [b["v"] for b in bars], "h": [b["h"] for b in bars], "l": [b["l"] for b in bars]}
 
 
+def fetch_finnhub_crypto_candles(symbol, lookback_days=14):
+    """For crypto tickers Alpaca doesn't carry, PAXG specifically. Same
+    output shape as fetch_crypto_candles so it's a drop-in for anything
+    that already consumes that dict. Finnhub's resolution values (1, 5,
+    15, 30, 60, D, W, M) match our own RESOLUTION env var directly, no
+    translation needed."""
+    end_ts = int(datetime.now(timezone.utc).timestamp())
+    start_ts = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp())
+    r = requests.get(
+        "https://finnhub.io/api/v1/crypto/candle",
+        params={"symbol": symbol, "resolution": RESOLUTION, "from": start_ts, "to": end_ts, "token": FINNHUB_KEY},
+        timeout=15,
+    )
+    if r.status_code in (401, 403):
+        print(f"{symbol}: {r.status_code} from Finnhub crypto, check FINNHUB_API_KEY. Raw response: {r.text}", file=sys.stderr)
+        return None
+    r.raise_for_status()
+    data = r.json()
+    if data.get("s") != "ok" or not data.get("c"):
+        print(f"{symbol}: no Finnhub crypto candles returned for resolution {RESOLUTION}. Raw response: {r.text}", file=sys.stderr)
+        return None
+    return {"c": data["c"], "v": data["v"], "h": data["h"], "l": data["l"]}
+
+
+def fetch_crypto_by_source(ticker, lookback_days=14):
+    """Dispatches to the right provider for a crypto ticker, since not
+    every crypto asset is on Alpaca, PAXG specifically isn't."""
+    if ticker["source"] == "finnhub":
+        return fetch_finnhub_crypto_candles(ticker["symbol"], lookback_days=lookback_days)
+    return fetch_crypto_candles(ticker["symbol"], lookback_days=lookback_days)
+
+
 def check_confluence(candles):
     closes = candles["c"]
     volumes = candles["v"]
@@ -256,13 +291,16 @@ def atr(highs, lows, closes, length):
     return sum(trs[-length:]) / length
 
 
-def compute_technical_context(symbol, is_crypto):
+def compute_technical_context(fetch_symbol, is_crypto, source="alpaca"):
     """Real, computed support/resistance, volatility, and longer-term
     trend, not left for a model to guess at from a single close price.
     Only called in analyze(), on a real trigger, not during the cheap
     check phase, this is enrichment for the AI council, not part of the
     confluence gate itself, which stays untouched."""
-    candles = fetch_crypto_candles(symbol) if is_crypto else fetch_candles(symbol)
+    if is_crypto:
+        candles = fetch_finnhub_crypto_candles(fetch_symbol) if source == "finnhub" else fetch_crypto_candles(fetch_symbol)
+    else:
+        candles = fetch_candles(fetch_symbol)
     if not candles or len(candles.get("c", [])) < LONG_TREND_LEN + 1:
         return {"note": "not enough price history for extended technical context (support/resistance, ATR, long-term trend)"}
 
@@ -440,12 +478,14 @@ def retrieve_similar(text, memory, top_k=RAG_TOP_K):
         return []
 
 
-def add_to_memory(memory, symbol, text, verdict, close_at_alert, is_crypto):
+def add_to_memory(memory, symbol, text, verdict, close_at_alert, is_crypto, fetch_symbol=None, source="alpaca"):
     try:
         model = _get_model()
         emb = model.encode(text).tolist()
         memory.append({
             "symbol": symbol,
+            "fetch_symbol": fetch_symbol or symbol,
+            "source": source,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "text": text,
             "embedding": emb,
@@ -511,8 +551,7 @@ def fetch_seat_search(symbol, is_crypto):
     in one call, not a second API call, same Tavily usage as before.
     Free Tavily call, not OpenRouter's :online plugin, which charges
     per result."""
-    base = symbol.replace("/USD", "") if is_crypto else symbol
-    query = f"{base} stock news market impact" if not is_crypto else f"{base} crypto news market impact"
+    query = f"{symbol} stock news market impact" if not is_crypto else f"{symbol} crypto news market impact"
     try:
         r = requests.post(
             "https://api.tavily.com/search",
@@ -963,43 +1002,70 @@ def check_only():
         print(json.dumps([]))
         return
 
-    watchlist = CRYPTO_TICKERS if is_crypto else TICKERS
-    symbols = list(watchlist)
-    if not is_crypto:
-        # One-off, this run only. Never written back to TICKERS itself,
-        # the next scheduled run only checks the real watchlist again.
+    results = []
+
+    if is_crypto:
+        for ticker in CRYPTO_TICKERS:
+            symbol, display = ticker["symbol"], ticker["display"]
+            try:
+                candles = fetch_crypto_by_source(ticker)
+                if not candles:
+                    print(f"{display}: no candle data, skipping", file=sys.stderr)
+                    continue
+                triggered, snapshot = check_confluence(candles)
+                if force:
+                    print(f"{display}: FORCE_TRIGGER set, forcing trigger", file=sys.stderr)
+                    triggered = True
+                elif display in force_tickers or symbol in force_tickers:
+                    print(f"{display}: in FORCE_TICKERS, forcing trigger", file=sys.stderr)
+                    triggered = True
+                if triggered:
+                    results.append({
+                        "symbol": display,
+                        "fetch_symbol": symbol,
+                        "source": ticker["source"],
+                        "snapshot": snapshot,
+                        "is_crypto": True,
+                        "halal_screened": True,
+                    })
+                else:
+                    print(f"{display}: no confluence this cycle", file=sys.stderr)
+            except Exception as e:
+                print(f"{display}: unhandled error during check ({e}), skipping this ticker, others still proceed", file=sys.stderr)
+    else:
+        symbols = list(TICKERS)
         extra = [s for s in force_tickers if s not in symbols]
         if extra:
             print(f"Adding {extra} for this run only, not halal-screened, not added to TICKERS", file=sys.stderr)
         symbols += extra
 
-    results = []
-    for symbol in symbols:
-        try:
-            candles = fetch_crypto_candles(symbol) if is_crypto else fetch_candles(symbol)
-            if not candles:
-                print(f"{symbol}: no candle data, skipping", file=sys.stderr)
-                continue
-            triggered, snapshot = check_confluence(candles)
-            symbol_key = symbol.replace("/USD", "") if is_crypto else symbol
-            is_extra = symbol not in watchlist
-            if force:
-                print(f"{symbol}: FORCE_TRIGGER set, forcing trigger", file=sys.stderr)
-                triggered = True
-            elif is_extra or symbol_key in force_tickers or symbol in force_tickers:
-                print(f"{symbol}: in FORCE_TICKERS, forcing trigger", file=sys.stderr)
-                triggered = True
-            if triggered:
-                results.append({
-                    "symbol": symbol,
-                    "snapshot": snapshot,
-                    "is_crypto": is_crypto,
-                    "halal_screened": not is_extra,
-                })
-            else:
-                print(f"{symbol}: no confluence this cycle", file=sys.stderr)
-        except Exception as e:
-            print(f"{symbol}: unhandled error during check ({e}), skipping this ticker, others still proceed", file=sys.stderr)
+        for symbol in symbols:
+            try:
+                candles = fetch_candles(symbol)
+                if not candles:
+                    print(f"{symbol}: no candle data, skipping", file=sys.stderr)
+                    continue
+                triggered, snapshot = check_confluence(candles)
+                is_extra = symbol not in TICKERS
+                if force:
+                    print(f"{symbol}: FORCE_TRIGGER set, forcing trigger", file=sys.stderr)
+                    triggered = True
+                elif is_extra or symbol in force_tickers:
+                    print(f"{symbol}: in FORCE_TICKERS, forcing trigger", file=sys.stderr)
+                    triggered = True
+                if triggered:
+                    results.append({
+                        "symbol": symbol,
+                        "fetch_symbol": symbol,
+                        "source": "alpaca",
+                        "snapshot": snapshot,
+                        "is_crypto": False,
+                        "halal_screened": not is_extra,
+                    })
+                else:
+                    print(f"{symbol}: no confluence this cycle", file=sys.stderr)
+            except Exception as e:
+                print(f"{symbol}: unhandled error during check ({e}), skipping this ticker, others still proceed", file=sys.stderr)
 
     print(json.dumps(results))
 
@@ -1019,16 +1085,17 @@ def analyze():
             time.sleep(20)
 
         symbol = item["symbol"]
+        fetch_symbol = item.get("fetch_symbol", symbol)
+        source = item.get("source", "alpaca")
         snapshot = item["snapshot"]
         is_crypto = item["is_crypto"]
         halal_screened = item.get("halal_screened", True)  # default True for older/manual payloads
 
         print(f"{symbol}: confluence triggered, gathering context")
-        tech_context = compute_technical_context(symbol, is_crypto)
+        tech_context = compute_technical_context(fetch_symbol, is_crypto, source=source)
         snapshot = {**snapshot, **tech_context}
         fundamentals = fetch_fundamentals(symbol, is_crypto=is_crypto)
-        news_query = symbol.replace("/USD", "") if is_crypto else symbol
-        news = fetch_news(news_query, is_crypto=is_crypto)
+        news = fetch_news(symbol, is_crypto=is_crypto)
 
         text = situation_text(symbol, snapshot, fundamentals, news)
         similar_past = retrieve_similar(text, memory)
@@ -1037,7 +1104,7 @@ def analyze():
         verdict, opinions = run_council(symbol, snapshot, fundamentals, news, similar_past=similar_past, is_crypto=is_crypto, macro_block=macro_block)
         send_alert(symbol, snapshot, verdict, halal_screened=halal_screened)
 
-        memory = add_to_memory(memory, symbol, text, verdict, snapshot.get("close"), is_crypto)
+        memory = add_to_memory(memory, symbol, text, verdict, snapshot.get("close"), is_crypto, fetch_symbol=fetch_symbol, source=source)
         print(f"{symbol}: alert sent")
 
     save_memory(memory)
@@ -1045,14 +1112,16 @@ def analyze():
 
 def backtest():
     """One-off diagnostic, not part of the live pipeline: walks real
-    historical Alpaca bars through the exact same check_confluence() that
-    runs live, bar by bar, and reports how often it would have actually
-    fired. Set BACKTEST_SYMBOL and optionally BACKTEST_IS_CRYPTO=1."""
+    historical bars through the exact same check_confluence() that runs
+    live, bar by bar, and reports how often it would have actually
+    fired. Set BACKTEST_SYMBOL and optionally BACKTEST_IS_CRYPTO=1 and
+    BACKTEST_SOURCE=finnhub for tickers not on Alpaca, PAXG specifically."""
     symbol = os.environ.get("BACKTEST_SYMBOL", "NVDA")
     is_crypto = os.environ.get("BACKTEST_IS_CRYPTO") == "1"
+    source = os.environ.get("BACKTEST_SOURCE", "alpaca")
 
     if is_crypto:
-        candles = fetch_crypto_candles(symbol, lookback_days=60, limit=5000)
+        candles = fetch_finnhub_crypto_candles(symbol, lookback_days=60) if source == "finnhub" else fetch_crypto_candles(symbol, lookback_days=60, limit=5000)
     else:
         candles = fetch_candles(symbol, lookback_days=60, limit=5000)
 
@@ -1213,9 +1282,12 @@ def postcheck():
     updated = False
     price_cache = {}
 
-    def current_price(symbol, is_crypto):
+    def current_price(symbol, fetch_symbol, is_crypto, source="alpaca"):
         if symbol not in price_cache:
-            candles = fetch_crypto_candles(symbol) if is_crypto else fetch_candles(symbol)
+            if is_crypto:
+                candles = fetch_finnhub_crypto_candles(fetch_symbol) if source == "finnhub" else fetch_crypto_candles(fetch_symbol)
+            else:
+                candles = fetch_candles(fetch_symbol)
             price_cache[symbol] = candles["c"][-1] if candles else None
         return price_cache[symbol]
 
@@ -1226,6 +1298,8 @@ def postcheck():
             continue
         age_days = (now - entry_time).total_seconds() / 86400
         symbol = entry["symbol"]
+        fetch_symbol = entry.get("fetch_symbol", symbol)
+        source = entry.get("source", "alpaca")
         is_crypto = entry.get("is_crypto", False)
         original_price = entry.get("close_at_alert")
         outcomes = entry.setdefault("outcomes", {h: {"checked": False} for h in HORIZONS})
@@ -1240,7 +1314,7 @@ def postcheck():
                 updated = True
                 continue
 
-            price = current_price(symbol, is_crypto)
+            price = current_price(symbol, fetch_symbol, is_crypto, source=source)
             if price is None:
                 print(f"{symbol}: couldn't fetch current price this run, {label} check deferred", file=sys.stderr)
                 continue
