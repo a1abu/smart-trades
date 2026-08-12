@@ -536,6 +536,15 @@ def _build_news_block(news):
     ) or "No recent news found."
 
 
+def _swing_grade(outcome_data):
+    """Backward compatible: entries graded after the multi-timeframe
+    rework carry a grades dict, older ones carry a single correct field
+    that was always the swing-trade call under the hood anyway."""
+    if "grades" in outcome_data:
+        return outcome_data["grades"].get("swing_trade")
+    return outcome_data.get("correct")
+
+
 def _build_past_block(similar_past):
     if not similar_past:
         return "No similar past situations in memory yet."
@@ -546,7 +555,8 @@ def _build_past_block(similar_past):
         for h, data in (e.get("outcomes") or {}).items():
             if not data.get("checked"):
                 continue
-            result = "CORRECT" if data.get("correct") else "WRONG" if data.get("correct") is False else "ungraded"
+            swing_correct = _swing_grade(data)
+            result = "CORRECT" if swing_correct else "WRONG" if swing_correct is False else "ungraded"
             pct = data.get("pct_change")
             part = f"{h}: {result} ({magnitude_label(pct)} {pct:+.1f}%)" if pct is not None else f"{h}: {result}"
             if data.get("reflection"):
@@ -1183,6 +1193,8 @@ def stats():
     per_horizon = {h: {"correct": 0, "wrong": 0, "ungraded": 0, "not_due": 0} for h in HORIZONS}
     per_ticker = {}
     per_direction = {"BUY": {"correct": 0, "wrong": 0}, "SELL": {"correct": 0, "wrong": 0}, "HOLD": {"correct": 0, "wrong": 0}}
+    timeframes = ("day_trade", "swing_trade", "short_term", "long_term")
+    per_timeframe = {tf: {"correct": 0, "wrong": 0} for tf in timeframes}
 
     for entry in memory:
         symbol = entry.get("symbol", "?")
@@ -1195,13 +1207,14 @@ def stats():
             if not data.get("checked"):
                 per_horizon[h]["not_due"] += 1
                 continue
-            correct = data.get("correct")
-            if correct is True:
+
+            swing_correct = _swing_grade(data)
+            if swing_correct is True:
                 per_horizon[h]["correct"] += 1
                 per_ticker[symbol][h]["correct"] += 1
                 if direction in per_direction:
                     per_direction[direction]["correct"] += 1
-            elif correct is False:
+            elif swing_correct is False:
                 per_horizon[h]["wrong"] += 1
                 per_ticker[symbol][h]["wrong"] += 1
                 if direction in per_direction:
@@ -1209,18 +1222,39 @@ def stats():
             else:
                 per_horizon[h]["ungraded"] += 1
 
+            grades = data.get("grades")
+            if grades:
+                for tf in timeframes:
+                    if grades.get(tf) is True:
+                        per_timeframe[tf]["correct"] += 1
+                    elif grades.get(tf) is False:
+                        per_timeframe[tf]["wrong"] += 1
+            elif swing_correct is not None:
+                # Old-schema entry, only ever had the one implicit
+                # swing-trade-equivalent grade.
+                if swing_correct is True:
+                    per_timeframe["swing_trade"]["correct"] += 1
+                else:
+                    per_timeframe["swing_trade"]["wrong"] += 1
+
     def rate_str(correct, wrong):
         graded = correct + wrong
         return f"{correct}/{graded} correct ({correct / graded * 100:.1f}%)" if graded else "no graded data yet"
 
     print(f"Total entries in memory.json: {len(memory)}\n")
 
-    print("Win rate by horizon:")
+    print("Accuracy by verdict timeframe (day-trade/swing-trade/short-term/long-term):")
+    for tf in timeframes:
+        d = per_timeframe[tf]
+        print(f"  {tf.replace('_', '-')}: {rate_str(d['correct'], d['wrong'])}")
+    print("  (older entries from before the multi-timeframe format only ever fed swing-trade here)")
+
+    print("\nWin rate by horizon (swing-trade call, the one graded against every horizon):")
     for h in HORIZONS:
         d = per_horizon[h]
         print(f"  {h}: {rate_str(d['correct'], d['wrong'])}, {d['ungraded']} ungraded, {d['not_due']} not due yet")
 
-    print("\nWin rate by ticker:")
+    print("\nWin rate by ticker (swing-trade call):")
     for symbol, horizons_data in per_ticker.items():
         print(f"  {symbol}:")
         for h in HORIZONS:
@@ -1229,29 +1263,50 @@ def stats():
                 continue
             print(f"    {h}: {rate_str(d['correct'], d['wrong'])}")
 
-    print("\nWin rate by verdict direction (across all horizons):")
+    print("\nWin rate by verdict direction (swing-trade call, across all horizons):")
     for direction, d in per_direction.items():
         print(f"  {direction}: {rate_str(d['correct'], d['wrong'])}")
 
 
-def parse_verdict_direction(verdict_text):
-    """Grading is still built around single horizons (3d-90d), closest
-    match to that is the SWING-TRADE call, not day-trade or long-term,
-    so that's what gets graded. The other three timeframes are real
-    verdicts a person reads, just not the one compared against price
-    outcomes here, that would need a separate grading rework."""
+def parse_all_verdicts(verdict_text):
+    """Extract all four timeframe calls from the current prompt format.
+    For memory entries from before the multi-timeframe restructuring,
+    just a single VERDICT: line, that call is treated as swing_trade
+    only, matching what grading already did for these entries, the
+    other three stay None, not graded, not faked."""
+    empty = {"day_trade": None, "swing_trade": None, "short_term": None, "long_term": None}
     if not verdict_text:
-        return None
-    labeled = re.search(r"SWING-TRADE:\s*(BUY|HOLD|SELL)\b", verdict_text, re.IGNORECASE)
-    if labeled:
-        return labeled.group(1).upper()
-    # Fallback for whenever a model doesn't follow the label exactly, or
-    # for old memory entries from before the multi-timeframe format.
+        return dict(empty)
+
+    labels = {"day_trade": "DAY-TRADE", "swing_trade": "SWING-TRADE", "short_term": "SHORT-TERM", "long_term": "LONG-TERM"}
+    result = dict(empty)
+    for key, label in labels.items():
+        match = re.search(rf"{label}:\s*(BUY|HOLD|SELL)\b", verdict_text, re.IGNORECASE)
+        if match:
+            result[key] = match.group(1).upper()
+
+    if any(result.values()):
+        return result
+
+    # None of the four labels matched at all, this is a pre-restructuring
+    # entry. Fall back to the old single VERDICT: label, then to a
+    # generic last-match scan, same fallback chain as before, just now
+    # feeding into swing_trade specifically rather than a bare return.
     labeled_old = re.search(r"VERDICT:\s*(BUY|HOLD|SELL)\b", verdict_text, re.IGNORECASE)
     if labeled_old:
-        return labeled_old.group(1).upper()
+        result["swing_trade"] = labeled_old.group(1).upper()
+        return result
     matches = re.findall(r"\b(BUY|HOLD|SELL)\b", verdict_text)
-    return matches[-1] if matches else None
+    if matches:
+        result["swing_trade"] = matches[-1]
+    return result
+
+
+def parse_verdict_direction(verdict_text):
+    """The swing-trade call specifically, still the single grading
+    target most of the system reports on. Kept as its own function since
+    most callers only need this one value, not all four."""
+    return parse_all_verdicts(verdict_text)["swing_trade"]
 
 
 def grade_verdict(direction, pct_change, hold_threshold=3.0):
@@ -1264,7 +1319,11 @@ def grade_verdict(direction, pct_change, hold_threshold=3.0):
     return None
 
 
-def build_reflection_prompt(entry, horizon_label, pct_change):
+def build_reflection_prompt(entry, horizon_label, pct_change, grades):
+    other_lines = "\n".join(
+        f"- {k.replace('_', '-')}: {'correct' if v else 'wrong' if v is False else 'not applicable (no call made for this timeframe)'}"
+        for k, v in grades.items() if k != "swing_trade"
+    )
     return f"""A trading verdict was given on {entry['timestamp'][:10]} for {entry['symbol']}.
 
 Original situation: {entry['text'][:600]}
@@ -1272,12 +1331,15 @@ Original situation: {entry['text'][:600]}
 Verdict given: {entry['verdict'][:400]}
 
 Actual outcome at the {horizon_label} mark: price moved {magnitude_label(pct_change)} ({pct_change:+.1f}%)
-since the alert, which means this verdict was wrong over that specific
-horizon (it may still be graded differently at other horizons). A barely
-wrong call and a sharply wrong call likely have different explanations,
-weigh that in your answer, a small miss might just be reasonable
-reasoning that landed on the wrong side of noise, a large one more
-likely means something material was missed.
+since the alert, which means the swing-trade call specifically was
+wrong over this horizon. A barely wrong call and a sharply wrong call
+likely have different explanations, weigh that in your answer, a small
+miss might just be reasonable reasoning that landed on the wrong side
+of noise, a large one more likely means something material was missed.
+
+For context, not something to explain away the swing-trade miss, just
+useful signal, the other timeframe calls graded at this same point:
+{other_lines}
 
 In 2-3 sentences, identify what in the original reasoning was likely
 mistaken or what information was probably missing, specific to this
@@ -1325,7 +1387,7 @@ def postcheck():
                 continue
 
             if not original_price:
-                slot.update({"checked": True, "correct": None})
+                slot.update({"checked": True, "grades": {k: None for k in ("day_trade", "swing_trade", "short_term", "long_term")}})
                 updated = True
                 continue
 
@@ -1335,20 +1397,21 @@ def postcheck():
                 continue
 
             pct_change = (price - original_price) / original_price * 100
-            direction = parse_verdict_direction(entry.get("verdict"))
-            correct = grade_verdict(direction, pct_change)
+            directions = parse_all_verdicts(entry.get("verdict"))
+            grades = {k: (grade_verdict(v, pct_change) if v else None) for k, v in directions.items()}
 
             slot["checked"] = True
             slot["pct_change"] = round(pct_change, 2)
-            slot["correct"] = correct
+            slot["grades"] = grades
 
-            if correct is False:
+            if grades.get("swing_trade") is False:
                 try:
-                    slot["reflection"] = call_with_fallback(build_reflection_prompt(entry, label, pct_change), FACT_CHECKER_MODEL, role_name="Reflection")[:500]
+                    slot["reflection"] = call_with_fallback(build_reflection_prompt(entry, label, pct_change, grades), FACT_CHECKER_MODEL, role_name="Reflection")[:500]
                 except Exception as e:
                     print(f"{symbol}: reflection call failed ({e}) for {label}, grading without one", file=sys.stderr)
 
-            print(f"{symbol}: {label} graded, {pct_change:+.1f}%, verdict was {'correct' if correct else 'wrong' if correct is False else 'ungraded'}")
+            summary = ", ".join(f"{k}={'correct' if v else 'wrong' if v is False else 'n/a'}" for k, v in grades.items())
+            print(f"{symbol}: {label} graded, {pct_change:+.1f}%, {summary}")
             updated = True
 
     if updated:
