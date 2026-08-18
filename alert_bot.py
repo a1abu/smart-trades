@@ -31,6 +31,7 @@ from datetime import datetime, timezone, timedelta
 FINNHUB_KEY = os.environ["FINNHUB_API_KEY"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_KEY_2 = os.environ["OPENROUTER_API_KEY_2"]
+OPENROUTER_KEY_3 = os.environ["OPENROUTER_API_KEY_3"]
 # Fallback only, never a primary provider. Every seat's model/provider/
 # weight config is untouched, this only fires when a seat's normal call
 # has already failed and exhausted its own retries.
@@ -82,7 +83,7 @@ TEAMS = [
         "label": "Team 1",
         "analyst": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free", "key_id": "primary"},
         "reviewer": {"name": "OpenRouter / Gemma 4 31B", "provider": "openrouter", "model": "google/gemma-4-31b-it:free", "key_id": "secondary"},
-        "arbiter": {"name": "OpenRouter / auto-router", "provider": "openrouter", "model": "openrouter/free", "key_id": "primary"},
+        "arbiter": {"name": "OpenRouter / auto-router", "provider": "openrouter", "model": "openrouter/free", "key_id": "tertiary"},
     },
     {
         "label": "Team 2",
@@ -95,7 +96,7 @@ TEAMS = [
 # search, runs before the Chief Arbiter, not after, so its corrections
 # can actually change the final verdict rather than just footnote it.
 FACT_CHECKER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
-FACT_CHECKER_KEY = "secondary"
+FACT_CHECKER_KEY = "tertiary"
 # Sees both Arbiter rulings and the fact-check report at the same time.
 # Also used as Team 1's Analyst and Team 2's Reviewer, so it isn't fully
 # independent of what it's judging, accepted trade-off for raw capability.
@@ -824,7 +825,12 @@ MAX_RETRY_WAIT = 20  # seconds, hard cap regardless of what Retry-After says
 
 
 def call_openrouter(prompt, model, key_id="primary", max_retries=3):
-    api_key = OPENROUTER_KEY_2 if key_id == "secondary" else OPENROUTER_KEY
+    if key_id == "secondary":
+        api_key = OPENROUTER_KEY_2
+    elif key_id == "tertiary":
+        api_key = OPENROUTER_KEY_3
+    else:
+        api_key = OPENROUTER_KEY
     for attempt in range(max_retries):
         try:
             r = requests.post(
@@ -899,8 +905,14 @@ def call_with_fallback(prompt, model, key_id="primary", role_name="seat"):
     try:
         return call_openrouter(prompt, model, key_id=key_id)
     except Exception as e:
-        print(f"{role_name}: primary call failed ({e}), falling back to NVIDIA", file=sys.stderr)
-        return call_nvidia(prompt)
+        print(f"{role_name}: primary failed ({e}), trying NVIDIA fallback", file=sys.stderr)
+        try:
+            result = call_nvidia(prompt)
+            print(f"{role_name}: NVIDIA fallback SUCCEEDED", file=sys.stderr)
+            return result
+        except Exception as e2:
+            print(f"{role_name}: NVIDIA fallback FAILED ({e2})", file=sys.stderr)
+            raise
 
 
 def _call_member(member, prompt, seen_models=None):
@@ -1286,6 +1298,9 @@ def parse_all_verdicts(verdict_text):
             result[key] = match.group(1).upper()
 
     if any(result.values()):
+        missing = [k for k, v in result.items() if v is None]
+        if missing:
+            print(f"parse_all_verdicts: only {4 - len(missing)}/4 labels parsed, missing {missing}, likely format drift on this entry's verdict text, grading will have real gaps for those timeframes", file=sys.stderr)
         return result
 
     # None of the four labels matched at all, this is a pre-restructuring
