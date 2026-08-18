@@ -63,7 +63,7 @@ VOL_LEN = 20
 VOL_MULT = 1.5
 WINDOW_BARS = 4
 
-MEMORY_FILE = "memory.json"
+MEMORY_FILE = "memory-repo/memory.json"
 RAG_TOP_K = 3
 
 # How many days after an alert to check whether the verdict held up.
