@@ -8,6 +8,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout private memory repo
+        uses: actions/checkout@v4
+        with:
+          repository: a1abu/smart-trades-memory
+          token: ${{ secrets.MEMORY_REPO_TOKEN }}
+          path: memory-repo
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
