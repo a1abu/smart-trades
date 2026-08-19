@@ -732,10 +732,31 @@ LONG-TERM: [BUY, HOLD, or SELL, exactly one word]
 REASON: [2-3 sentences, citing the specific evidence that decided the SWING-TRADE ruling specifically]"""
 
 
-def build_factcheck_prompt(symbol, team1_ruling, team2_ruling, search_block):
+def build_factcheck_prompt(symbol, snapshot, fundamentals, team1_ruling, team2_ruling, search_block):
     return f"""Two independent teams reached rulings on {symbol}. Your job is
 verification, not opinion: check the specific factual claims in both
-rulings below against the live search results provided.
+rulings below.
+
+You have two separate sources, use the right one per claim:
+
+1. Technical and fundamental figures (RSI, EMA, support/resistance,
+volume, P/E, ROE, and similar) can ONLY be checked against the ground
+truth data below, not web search. These are computed locally and were
+never published anywhere for a search to find, that's expected, not a
+gap. A claim matching this data is CONFIRMED. A claim citing a
+different number than what's actually here is WRONG. Don't mark these
+UNVERIFIABLE just because search doesn't surface them.
+
+Ground truth technical snapshot: {json.dumps(snapshot)}
+Ground truth fundamentals: {json.dumps(fundamentals)}
+
+2. Everything else, news events, announcements, macro claims, named
+deals or partnerships, check against the live search results below.
+UNVERIFIABLE belongs here specifically, when search genuinely doesn't
+cover it.
+
+Live search results:
+{search_block}
 
 Team 1 ruling:
 {team1_ruling}
@@ -743,22 +764,21 @@ Team 1 ruling:
 Team 2 ruling:
 {team2_ruling}
 
-Live search results to check the above against:
-{search_block}
-
 For each specific, checkable claim (a number, a date, a named event),
 give one block in exactly this format, plain text, no markdown:
 
 CLAIM: [the specific claim, quoted or closely paraphrased]
 STATUS: [CONFIRMED, WRONG, or UNVERIFIABLE]
-CORRECTION: [if WRONG, what the search results actually show. If
-CONFIRMED or UNVERIFIABLE, write "n/a"]
+CORRECTION: [if WRONG, what's actually true. If CONFIRMED or
+UNVERIFIABLE, write "n/a"]
 
-Use WRONG only when the search results actively contradict the claim.
-Use UNVERIFIABLE when the search results simply don't cover it, that is
-not the same thing as wrong, don't blur the two together. If a claim
-matches a different company or ticker than {symbol}, that's WRONG, not
-unverifiable, say so explicitly.
+Use WRONG when a claim contradicts either the ground truth data or the
+search results. Use UNVERIFIABLE only for external/news/macro claims
+search genuinely doesn't cover, never for technical or fundamental
+figures, those always resolve to CONFIRMED or WRONG since the ground
+truth data is always available. If a claim matches a different company
+or ticker than {symbol}, that's WRONG, not unverifiable, say so
+explicitly.
 
 Check at most the 5 most consequential claims, the ones the verdict
 actually leans on. Keep each block short."""
@@ -966,7 +986,7 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
 
     try:
         fc_search = fetch_seat_search(symbol, is_crypto)
-        fc_prompt = build_factcheck_prompt(symbol, t1, t2, fc_search)
+        fc_prompt = build_factcheck_prompt(symbol, snapshot, fundamentals, t1, t2, fc_search)
         fc_key = (FACT_CHECKER_KEY, FACT_CHECKER_MODEL)
         if fc_key in seen_models:
             print("Fact-checker model already called on this key earlier this run, pausing 10s", file=sys.stderr)
