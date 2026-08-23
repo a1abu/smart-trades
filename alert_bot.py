@@ -1244,7 +1244,7 @@ def stats():
     per_horizon = {h: {"correct": 0, "wrong": 0, "ungraded": 0, "not_due": 0} for h in HORIZONS}
     per_ticker = {}
     per_direction = {"BUY": {"correct": 0, "wrong": 0}, "SELL": {"correct": 0, "wrong": 0}, "HOLD": {"correct": 0, "wrong": 0}}
-    timeframes = ("day_trade", "swing_trade", "short_term", "long_term")
+    timeframes = ("day_trade", "swing_trade", "short_term")
     per_timeframe = {tf: {"correct": 0, "wrong": 0} for tf in timeframes}
 
     for entry in memory:
@@ -1294,7 +1294,7 @@ def stats():
 
     print(f"Total entries in memory.json: {len(memory)}\n")
 
-    print("Accuracy by verdict timeframe (day-trade/swing-trade/short-term/long-term):")
+    print("Accuracy by verdict timeframe (day-trade/swing-trade/short-term):")
     for tf in timeframes:
         d = per_timeframe[tf]
         print(f"  {tf.replace('_', '-')}: {rate_str(d['correct'], d['wrong'])}")
@@ -1324,7 +1324,11 @@ def parse_all_verdicts(verdict_text):
     For memory entries from before the multi-timeframe restructuring,
     just a single VERDICT: line, that call is treated as swing_trade
     only, matching what grading already did for these entries, the
-    other three stay None, not graded, not faked."""
+    other three stay None, not graded, not faked. Long-term is still
+    requested and shown in the notification, it's just never graded
+    against price outcomes in postcheck(), since our longest horizon
+    check is 90 days, shorter than what "long-term" itself claims to
+    mean, that restriction lives there specifically, not here."""
     empty = {"day_trade": None, "swing_trade": None, "short_term": None, "long_term": None}
     if not verdict_text:
         return dict(empty)
@@ -1453,6 +1457,7 @@ def postcheck():
             pct_change = (price - original_price) / original_price * 100
             directions = parse_all_verdicts(entry.get("verdict"))
             grades = {k: (grade_verdict(v, pct_change) if v else None) for k, v in directions.items()}
+            grades["long_term"] = None  # shown in the notification, never graded, our 90d ceiling can't test it
 
             slot["checked"] = True
             slot["pct_change"] = round(pct_change, 2)
