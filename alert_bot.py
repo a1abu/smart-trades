@@ -1377,32 +1377,53 @@ def grade_verdict(direction, pct_change, buy_sell_threshold=1.5, hold_threshold=
     return None
 
 
-def build_reflection_prompt(entry, horizon_label, pct_change, grades):
-    other_lines = "\n".join(
-        f"- {k.replace('_', '-')}: {'correct' if v else 'wrong' if v is False else 'not applicable (no call made for this timeframe)'}"
-        for k, v in grades.items() if k != "swing_trade"
-    )
-    return f"""A trading verdict was given on {entry['timestamp'][:10]} for {entry['symbol']}.
+def build_batch_reflection_prompt(items):
+    """items: list of (entry, label, pct_change, grades) tuples, all
+    graded wrong on swing-trade. Batches multiple reflections into one
+    call instead of one call per wrong verdict, so a big backlog doesn't
+    fire dozens of individual calls back to back into the same rate
+    limits."""
+    blocks = []
+    for i, (entry, label, pct_change, grades) in enumerate(items, 1):
+        other_lines = "\n".join(
+            f"  - {k.replace('_', '-')}: {'correct' if v else 'wrong' if v is False else 'not applicable'}"
+            for k, v in grades.items() if k != "swing_trade"
+        )
+        blocks.append(f"""ITEM {i}: {entry['symbol']} verdict from {entry['timestamp'][:10]}, checked at the {label} mark
+Original situation: {entry['text'][:400]}
+Verdict given: {entry['verdict'][:300]}
+Actual outcome: price moved {magnitude_label(pct_change)} ({pct_change:+.1f}%), the swing-trade call was wrong here
+Other timeframes at this same point:
+{other_lines}""")
 
-Original situation: {entry['text'][:600]}
+    return f"""Below are {len(items)} separate trading verdicts, each one wrong on
+its swing-trade call. For EACH item, in 2-3 sentences, identify what in
+the original reasoning was likely mistaken or what information was
+probably missing, specific to that item, referencing its own original
+reasoning directly, don't just restate that it was wrong. A barely
+wrong call and a sharply wrong call likely have different explanations,
+weigh that per item, don't give every item the same generic answer.
 
-Verdict given: {entry['verdict'][:400]}
+{chr(10).join(blocks)}
 
-Actual outcome at the {horizon_label} mark: price moved {magnitude_label(pct_change)} ({pct_change:+.1f}%)
-since the alert, which means the swing-trade call specifically was
-wrong over this horizon. A barely wrong call and a sharply wrong call
-likely have different explanations, weigh that in your answer, a small
-miss might just be reasonable reasoning that landed on the wrong side
-of noise, a large one more likely means something material was missed.
+Structure your answer as exactly {len(items)} blocks, one per item, in
+this format, plain text, no markdown:
 
-For context, not something to explain away the swing-trade miss, just
-useful signal, the other timeframe calls graded at this same point:
-{other_lines}
+REFLECTION 1: [your 2-3 sentence reflection for item 1]
+REFLECTION 2: [your 2-3 sentence reflection for item 2]
+...and so on for every item, in order, matching the item numbers above."""
 
-In 2-3 sentences, identify what in the original reasoning was likely
-mistaken or what information was probably missing, specific to this
-timeframe. Be specific, reference the original reasoning directly, don't
-just restate that it was wrong."""
+
+def parse_batch_reflections(response_text, count):
+    """Extract up to `count` numbered reflections from a batch response.
+    Returns a list the same length as count, None for any that didn't
+    parse, so one bit of format drift doesn't lose the reflections that
+    did come through cleanly."""
+    results = []
+    for i in range(1, count + 1):
+        match = re.search(rf"REFLECTION {i}:\s*(.+?)(?=REFLECTION {i + 1}:|$)", response_text, re.DOTALL | re.IGNORECASE)
+        results.append(match.group(1).strip() if match else None)
+    return results
 
 
 def postcheck():
@@ -1410,12 +1431,15 @@ def postcheck():
     (3d/7d/14d/30d/60d/90d) have now come due and haven't been graded
     yet. Fetches each symbol's current price at most once per run, no
     matter how many entries or horizons need it, then applies that price
-    across everything due. Only calls an LLM when a given horizon graded
-    wrong, correct horizons get graded silently."""
+    across everything due. Wrong verdicts are collected during grading
+    and reflected on afterward in small batches, not one call each, a
+    big backlog shouldn't fire dozens of individual calls back to back
+    into the same rate limits."""
     memory = load_memory()
     now = datetime.now(timezone.utc)
     updated = False
     price_cache = {}
+    pending_reflections = []
 
     def current_price(symbol, fetch_symbol, is_crypto, source="alpaca"):
         if symbol not in price_cache:
@@ -1464,14 +1488,29 @@ def postcheck():
             slot["grades"] = grades
 
             if grades.get("swing_trade") is False:
-                try:
-                    slot["reflection"] = call_with_fallback(build_reflection_prompt(entry, label, pct_change, grades), FACT_CHECKER_MODEL, role_name="Reflection")[:500]
-                except Exception as e:
-                    print(f"{symbol}: reflection call failed ({e}) for {label}, grading without one", file=sys.stderr)
+                pending_reflections.append((slot, entry, label, pct_change, grades))
 
             summary = ", ".join(f"{k}={'correct' if v else 'wrong' if v is False else 'n/a'}" for k, v in grades.items())
             print(f"{symbol}: {label} graded, {pct_change:+.1f}%, {summary}")
             updated = True
+
+    REFLECTION_BATCH_SIZE = 5
+    for i in range(0, len(pending_reflections), REFLECTION_BATCH_SIZE):
+        if i > 0:
+            time.sleep(5)
+        batch = pending_reflections[i:i + REFLECTION_BATCH_SIZE]
+        items = [(entry, label, pct_change, grades) for (slot, entry, label, pct_change, grades) in batch]
+        try:
+            prompt = build_batch_reflection_prompt(items)
+            response = call_with_fallback(prompt, FACT_CHECKER_MODEL, role_name=f"Reflection batch ({len(batch)} items)")
+            reflections = parse_batch_reflections(response, len(batch))
+            for (slot, entry, label, pct_change, grades), reflection in zip(batch, reflections):
+                if reflection:
+                    slot["reflection"] = reflection[:500]
+                else:
+                    print(f"{entry['symbol']}: batch reflection didn't parse for {label}, grading without one", file=sys.stderr)
+        except Exception as e:
+            print(f"Reflection batch failed entirely ({e}), {len(batch)} item(s) left without a reflection this run", file=sys.stderr)
 
     if updated:
         save_memory(memory)
