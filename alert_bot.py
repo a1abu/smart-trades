@@ -32,6 +32,7 @@ FINNHUB_KEY = os.environ["FINNHUB_API_KEY"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_KEY_2 = os.environ["OPENROUTER_API_KEY_2"]
 OPENROUTER_KEY_3 = os.environ["OPENROUTER_API_KEY_3"]
+OPENROUTER_KEY_4 = os.environ["OPENROUTER_API_KEY_4"]
 # Fallback only, never a primary provider. Every seat's model/provider/
 # weight config is untouched, this only fires when a seat's normal call
 # has already failed and exhausted its own retries.
@@ -49,7 +50,7 @@ ALPACA_TIMEFRAME = {"5": "5Min", "15": "15Min", "60": "1Hour", "D": "1Day"}[RESO
 
 # Halal-screened watchlist. Edit this yourself, nothing here gets
 # auto-added. Long-only, no leverage, no options, no shorting.
-TICKERS = ["AAPL", "AMD", "GOOG"]
+TICKERS = ["AAPL", "AMD", "IAU"]
 CRYPTO_TICKERS = [
     {"symbol": "BTC/USD", "source": "alpaca", "display": "BTC"},
     {"symbol": "PAXGUSD", "source": "kraken", "display": "PAXG"},
@@ -89,7 +90,7 @@ TEAMS = [
         "label": "Team 2",
         "analyst": {"name": "OpenRouter / Gemma 4 31B", "provider": "openrouter", "model": "google/gemma-4-31b-it:free", "key_id": "secondary"},
         "reviewer": {"name": "OpenRouter / Nemotron 3 Ultra", "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free", "key_id": "primary"},
-        "arbiter": {"name": "OpenRouter / auto-router", "provider": "openrouter", "model": "openrouter/free", "key_id": "secondary"},
+        "arbiter": {"name": "OpenRouter / auto-router", "provider": "openrouter", "model": "openrouter/free", "key_id": "quaternary"},
     },
 ]
 # Reads both Arbiter rulings and verifies specific claims against live
@@ -101,7 +102,7 @@ FACT_CHECKER_KEY = "tertiary"
 # Also used as Team 1's Analyst and Team 2's Reviewer, so it isn't fully
 # independent of what it's judging, accepted trade-off for raw capability.
 CHIEF_ARBITER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
-CHIEF_ARBITER_KEY = "primary"
+CHIEF_ARBITER_KEY = "quaternary"
 
 
 # ── Technical indicators ────────────────────────────────────────────
@@ -849,6 +850,8 @@ def call_openrouter(prompt, model, key_id="primary", max_retries=3):
         api_key = OPENROUTER_KEY_2
     elif key_id == "tertiary":
         api_key = OPENROUTER_KEY_3
+    elif key_id == "quaternary":
+        api_key = OPENROUTER_KEY_4
     else:
         api_key = OPENROUTER_KEY
     for attempt in range(max_retries):
