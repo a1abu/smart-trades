@@ -50,7 +50,7 @@ ALPACA_TIMEFRAME = {"5": "5Min", "15": "15Min", "60": "1Hour", "D": "1Day"}[RESO
 
 # Halal-screened watchlist. Edit this yourself, nothing here gets
 # auto-added. Long-only, no leverage, no options, no shorting.
-TICKERS = ["AAPL", "AMD", "GOOG"]
+TICKERS = ["AAPL", "AMD", "IAU"]
 CRYPTO_TICKERS = [
     {"symbol": "BTC/USD", "source": "alpaca", "display": "BTC"},
     {"symbol": "PAXGUSD", "source": "kraken", "display": "PAXG"},
@@ -916,26 +916,42 @@ def call_nvidia(prompt, model=NVIDIA_FALLBACK_MODEL, max_retries=3):
         return _sanity_check(r.json()["choices"][0]["message"]["content"])
 
 
+ALL_OPENROUTER_KEYS = ("primary", "secondary", "tertiary", "quaternary")
+
+
 def call_with_fallback(prompt, model, key_id="primary", role_name="seat"):
     """Every seat goes through this now, not call_openrouter directly.
-    Tries the seat's own normal call first, exactly as configured,
-    unchanged. Only if that fails entirely, all of call_openrouter's own
-    retries exhausted, does this reach for NVIDIA once as a last resort,
-    so a role still gets an answer for this run instead of coming back
-    empty. If NVIDIA also fails, the exception propagates up exactly as
-    before, the existing fail-open handling at each call site is
-    untouched."""
+    Tries the seat's own assigned key first, exactly as configured,
+    unchanged. If that fails, tries the other three OpenRouter keys with
+    the same model before reaching for NVIDIA, since a different key on
+    a provider we already trust beats reaching for a known-flaky one
+    right away. Only if all four OpenRouter keys fail does this try
+    NVIDIA as the final fallback. If that also fails, the exception
+    propagates up exactly as before, the existing fail-open handling at
+    each call site is untouched."""
     try:
         return call_openrouter(prompt, model, key_id=key_id)
     except Exception as e:
-        print(f"{role_name}: primary failed ({e}), trying NVIDIA fallback", file=sys.stderr)
+        print(f"{role_name}: assigned key ({key_id}) failed ({e}), trying other OpenRouter keys", file=sys.stderr)
+
+    for backup_key in ALL_OPENROUTER_KEYS:
+        if backup_key == key_id:
+            continue
         try:
-            result = call_nvidia(prompt)
-            print(f"{role_name}: NVIDIA fallback SUCCEEDED", file=sys.stderr)
+            result = call_openrouter(prompt, model, key_id=backup_key)
+            print(f"{role_name}: backup key ({backup_key}) SUCCEEDED", file=sys.stderr)
             return result
-        except Exception as e2:
-            print(f"{role_name}: NVIDIA fallback FAILED ({e2})", file=sys.stderr)
-            raise
+        except Exception as e:
+            print(f"{role_name}: backup key ({backup_key}) also failed ({e})", file=sys.stderr)
+
+    print(f"{role_name}: all four OpenRouter keys failed, trying NVIDIA as last resort", file=sys.stderr)
+    try:
+        result = call_nvidia(prompt)
+        print(f"{role_name}: NVIDIA fallback SUCCEEDED", file=sys.stderr)
+        return result
+    except Exception as e2:
+        print(f"{role_name}: NVIDIA fallback FAILED ({e2})", file=sys.stderr)
+        raise
 
 
 def _call_member(member, prompt, seen_models=None):
