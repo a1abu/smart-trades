@@ -1367,11 +1367,11 @@ def parse_verdict_direction(verdict_text):
     return parse_all_verdicts(verdict_text)["swing_trade"]
 
 
-def grade_verdict(direction, pct_change, hold_threshold=3.0):
+def grade_verdict(direction, pct_change, buy_sell_threshold=1.5, hold_threshold=3.0):
     if direction == "BUY":
-        return pct_change > 0
+        return pct_change > buy_sell_threshold
     if direction == "SELL":
-        return pct_change < 0
+        return pct_change < -buy_sell_threshold
     if direction == "HOLD":
         return abs(pct_change) < hold_threshold
     return None
