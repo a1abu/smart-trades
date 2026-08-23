@@ -50,7 +50,7 @@ ALPACA_TIMEFRAME = {"5": "5Min", "15": "15Min", "60": "1Hour", "D": "1Day"}[RESO
 
 # Halal-screened watchlist. Edit this yourself, nothing here gets
 # auto-added. Long-only, no leverage, no options, no shorting.
-TICKERS = ["AAPL", "AMD", "IAU"]
+TICKERS = ["AAPL", "AMD", "GOOG"]
 CRYPTO_TICKERS = [
     {"symbol": "BTC/USD", "source": "alpaca", "display": "BTC"},
     {"symbol": "PAXGUSD", "source": "kraken", "display": "PAXG"},
