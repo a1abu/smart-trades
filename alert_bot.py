@@ -60,6 +60,8 @@ EMA_LEN = 50
 RSI_LEN = 14
 RSI_FLOOR = 30
 RSI_CEIL = 50
+RSI_BEAR_FLOOR = 50
+RSI_BEAR_CEIL = 70
 VOL_LEN = 20
 VOL_MULT = 1.5
 WINDOW_BARS = 4
@@ -237,13 +239,21 @@ def check_confluence(candles):
     rsi14 = rsi(closes, RSI_LEN)
     vol_avg = sma(volumes, VOL_LEN)
 
-    def price_cross(i):
+    def price_cross_above(i):
         return closes[i - 1] <= ema50[i - 1] and closes[i] > ema50[i]
+
+    def price_cross_below(i):
+        return closes[i - 1] >= ema50[i - 1] and closes[i] < ema50[i]
 
     def rsi_recovering(i):
         if rsi14[i] is None or rsi14[i - 1] is None:
             return False
         return RSI_FLOOR < rsi14[i] < RSI_CEIL and rsi14[i] > rsi14[i - 1]
+
+    def rsi_weakening(i):
+        if rsi14[i] is None or rsi14[i - 1] is None:
+            return False
+        return RSI_BEAR_FLOOR < rsi14[i] < RSI_BEAR_CEIL and rsi14[i] < rsi14[i - 1]
 
     def vol_spike(i):
         return vol_avg[i] is not None and volumes[i] > vol_avg[i] * VOL_MULT
@@ -257,18 +267,29 @@ def check_confluence(candles):
                 return back
         return None
 
-    def confluence_at(idx):
+    def confluence_at(idx, price_fn, rsi_fn):
         """Was confluence true looking back WINDOW_BARS from this bar?"""
         return (
-            bars_since_at(idx, price_cross) is not None
-            and bars_since_at(idx, rsi_recovering) is not None
+            bars_since_at(idx, price_fn) is not None
+            and bars_since_at(idx, rsi_fn) is not None
             and bars_since_at(idx, vol_spike) is not None
         )
 
     last_idx = len(closes) - 1
-    now_confluence = confluence_at(last_idx)
-    prev_confluence = confluence_at(last_idx - 1)
-    fresh_trigger = now_confluence and not prev_confluence  # only fire on the rising edge, not every bar it holds
+    now_bull = confluence_at(last_idx, price_cross_above, rsi_recovering)
+    prev_bull = confluence_at(last_idx - 1, price_cross_above, rsi_recovering)
+    fresh_bull = now_bull and not prev_bull  # only fire on the rising edge, not every bar it holds
+
+    now_bear = confluence_at(last_idx, price_cross_below, rsi_weakening)
+    prev_bear = confluence_at(last_idx - 1, price_cross_below, rsi_weakening)
+    fresh_bear = now_bear and not prev_bear
+
+    # Both firing in the same window is a rare, contradictory edge case
+    # (price whipsawing across the EMA within WINDOW_BARS). Bullish takes
+    # precedence if it somehow happens, simple, documented tie-break
+    # rather than trying to report two directions from one check.
+    fresh_trigger = fresh_bull or fresh_bear
+    direction = "bullish" if fresh_bull else ("bearish" if fresh_bear else None)
 
     snapshot = {
         "close": closes[-1],
@@ -279,16 +300,29 @@ def check_confluence(candles):
     }
 
     if fresh_trigger:
-        price_ago = bars_since_at(last_idx, price_cross)
-        rsi_ago = bars_since_at(last_idx, rsi_recovering)
-        vol_ago = bars_since_at(last_idx, vol_spike)
-        snapshot["confluence_explanation"] = (
-            f"Price crossed above the {EMA_LEN}-bar EMA {price_ago} bar(s) ago. "
-            f"RSI recovered into the {RSI_FLOOR}-{RSI_CEIL} zone {rsi_ago} bar(s) ago, "
-            f"currently at {round(rsi14[last_idx], 2) if rsi14[last_idx] is not None else 'n/a'}. "
-            f"Volume spiked above {VOL_MULT}x its {VOL_LEN}-bar average {vol_ago} bar(s) ago, "
-            f"currently {volumes[last_idx]} vs a {round(vol_avg[last_idx], 0) if vol_avg[last_idx] is not None else 'n/a'} average."
-        )
+        snapshot["trigger_direction"] = direction
+        if direction == "bullish":
+            price_ago = bars_since_at(last_idx, price_cross_above)
+            rsi_ago = bars_since_at(last_idx, rsi_recovering)
+            vol_ago = bars_since_at(last_idx, vol_spike)
+            snapshot["confluence_explanation"] = (
+                f"Bullish setup. Price crossed above the {EMA_LEN}-bar EMA {price_ago} bar(s) ago. "
+                f"RSI recovered into the {RSI_FLOOR}-{RSI_CEIL} zone {rsi_ago} bar(s) ago, "
+                f"currently at {round(rsi14[last_idx], 2) if rsi14[last_idx] is not None else 'n/a'}. "
+                f"Volume spiked above {VOL_MULT}x its {VOL_LEN}-bar average {vol_ago} bar(s) ago, "
+                f"currently {volumes[last_idx]} vs a {round(vol_avg[last_idx], 0) if vol_avg[last_idx] is not None else 'n/a'} average."
+            )
+        else:
+            price_ago = bars_since_at(last_idx, price_cross_below)
+            rsi_ago = bars_since_at(last_idx, rsi_weakening)
+            vol_ago = bars_since_at(last_idx, vol_spike)
+            snapshot["confluence_explanation"] = (
+                f"Bearish setup. Price crossed below the {EMA_LEN}-bar EMA {price_ago} bar(s) ago. "
+                f"RSI weakened through the {RSI_BEAR_FLOOR}-{RSI_BEAR_CEIL} zone {rsi_ago} bar(s) ago, "
+                f"currently at {round(rsi14[last_idx], 2) if rsi14[last_idx] is not None else 'n/a'}. "
+                f"Volume spiked above {VOL_MULT}x its {VOL_LEN}-bar average {vol_ago} bar(s) ago, "
+                f"currently {volumes[last_idx]} vs a {round(vol_avg[last_idx], 0) if vol_avg[last_idx] is not None else 'n/a'} average."
+            )
 
     return fresh_trigger, snapshot
 
@@ -495,7 +529,7 @@ def retrieve_similar(text, memory, top_k=RAG_TOP_K):
         return []
 
 
-def add_to_memory(memory, symbol, text, verdict, close_at_alert, is_crypto, fetch_symbol=None, source="alpaca"):
+def add_to_memory(memory, symbol, text, verdict, close_at_alert, is_crypto, fetch_symbol=None, source="alpaca", trigger_direction=None):
     try:
         model = _get_model()
         emb = model.encode(text).tolist()
@@ -503,6 +537,7 @@ def add_to_memory(memory, symbol, text, verdict, close_at_alert, is_crypto, fetc
             "symbol": symbol,
             "fetch_symbol": fetch_symbol or symbol,
             "source": source,
+            "trigger_direction": trigger_direction,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "text": text,
             "embedding": emb,
@@ -552,7 +587,8 @@ def _build_past_block(similar_past):
         return "No similar past situations in memory yet."
     past_lines = []
     for e in similar_past:
-        line = f"- {e['timestamp'][:10]}: {e['text'][:200]} -> verdict was: {e['verdict'][:150]}"
+        direction_tag = f" [{e['trigger_direction']} setup]" if e.get("trigger_direction") else ""
+        line = f"- {e['timestamp'][:10]}{direction_tag}: {e['text'][:200]} -> verdict was: {e['verdict'][:150]}"
         graded_parts = []
         for h, data in (e.get("outcomes") or {}).items():
             if not data.get("checked"):
@@ -624,11 +660,16 @@ def build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block,
     else:
         weighting = "Weigh the technical picture and the fundamentals together, genuinely together. Neither is primary, neither is background."
 
+    direction = snapshot.get("trigger_direction", "bullish")
+    if direction == "bullish":
+        direction_note = "A bullish technical signal fired, price crossing above its average with RSI recovering and volume confirming. That's only a trigger to look, not evidence of anything on its own."
+    else:
+        direction_note = "A bearish technical signal fired, price crossing below its average with RSI weakening and volume confirming. This system is long-only, it never shorts, but a bearish signal is still real, legitimate grounds for a SELL or HOLD call, don't discount it just because there's no short to act on. That's only a trigger to look, not evidence of anything on its own."
+
     return f"""You are one of two independent analysts evaluating {symbol} for a
 long-only, halal-compliant trader. You're reasoning entirely on your
 own, you have not seen and will not see anyone else's opinion on this.
-A technical signal fired, that's only a trigger to look, not evidence of
-anything on its own. {weighting}
+{direction_note} {weighting}
 
 Technical snapshot: {json.dumps(snapshot)}
 (includes support/resistance from the last {LEVELS_LEN} bars, {ATR_LEN}-period
@@ -1180,7 +1221,7 @@ def analyze():
         verdict, opinions = run_council(symbol, snapshot, fundamentals, news, similar_past=similar_past, is_crypto=is_crypto, macro_block=macro_block)
         send_alert(symbol, snapshot, verdict, halal_screened=halal_screened)
 
-        memory = add_to_memory(memory, symbol, text, verdict, snapshot.get("close"), is_crypto, fetch_symbol=fetch_symbol, source=source)
+        memory = add_to_memory(memory, symbol, text, verdict, snapshot.get("close"), is_crypto, fetch_symbol=fetch_symbol, source=source, trigger_direction=snapshot.get("trigger_direction"))
         print(f"{symbol}: alert sent")
 
     save_memory(memory)
