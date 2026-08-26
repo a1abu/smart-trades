@@ -1073,11 +1073,17 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
 # ── Delivery ─────────────────────────────────────────────────────────
 
 def send_alert(symbol, snapshot, verdict, halal_screened=True):
+    direction = snapshot.get("trigger_direction")
     title = f"{symbol} {ALPACA_TIMEFRAME} signal"
+    if direction:
+        title = f"[{direction.capitalize()}] {title}"
     if not halal_screened:
         title = f"[NOT HALAL-SCREENED] {title}"
     fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    header = f"[{ALPACA_TIMEFRAME} chart, checked {fetched_at}, Alpaca free tier is ~15min delayed]\n\n"
+    header = f"[{ALPACA_TIMEFRAME} chart, checked {fetched_at}, Alpaca free tier is ~15min delayed]"
+    if direction:
+        header += f"\n[{direction.capitalize()} technical trigger]"
+    header += "\n\n"
     if not halal_screened:
         header += f"WARNING: {symbol} is NOT on your halal-screened watchlist. This is a one-off forced check only, treat it as informational, not a vetted call.\n\n"
     body = header + (verdict if verdict else f"Confluence fired but the AI council was unreachable.\n{json.dumps(snapshot)}")
