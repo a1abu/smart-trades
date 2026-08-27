@@ -50,7 +50,7 @@ ALPACA_TIMEFRAME = {"5": "5Min", "15": "15Min", "60": "1Hour", "D": "1Day"}[RESO
 
 # Halal-screened watchlist. Edit this yourself, nothing here gets
 # auto-added. Long-only, no leverage, no options, no shorting.
-TICKERS = ["AAPL", "AMD", "GOOG", "NVDA"]
+TICKERS = ["AAPL", "AMD", "GOOG"]
 CRYPTO_TICKERS = [
     {"symbol": "BTC/USD", "source": "alpaca", "display": "BTC"},
     {"symbol": "PAXGUSD", "source": "kraken", "display": "PAXG"},
@@ -163,7 +163,14 @@ def fetch_candles(symbol, lookback_days=None, limit=500):
     return {"c": [b["c"] for b in bars], "v": [b["v"] for b in bars], "h": [b["h"] for b in bars], "l": [b["l"] for b in bars]}
 
 
-def fetch_crypto_candles(symbol, lookback_days=14, limit=500):
+def fetch_crypto_candles(symbol, lookback_days=14, limit=None):
+    if limit is None:
+        # Crypto trades 24/7, unlike stocks, so the same lookback_days at
+        # the same resolution can need far more bars, silently truncated
+        # to old, stale data by a flat default limit otherwise. Size it
+        # to the actual window requested, not a fixed guess.
+        bars_per_day = {"1Min": 1440, "5Min": 288, "15Min": 96, "1Hour": 24, "1Day": 1}.get(ALPACA_TIMEFRAME, 96)
+        limit = min(10000, int(lookback_days * bars_per_day * 1.1))  # 10% margin, Alpaca's own page cap is 10,000
     start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get(
         "https://data.alpaca.markets/v1beta3/crypto/us/bars",
@@ -1244,7 +1251,7 @@ def backtest():
     source = os.environ.get("BACKTEST_SOURCE", "alpaca")
 
     if is_crypto:
-        candles = fetch_kraken_candles(symbol) if source == "kraken" else fetch_crypto_candles(symbol, lookback_days=60, limit=5000)
+        candles = fetch_kraken_candles(symbol) if source == "kraken" else fetch_crypto_candles(symbol, lookback_days=60)
     else:
         candles = fetch_candles(symbol, lookback_days=60, limit=5000)
 
