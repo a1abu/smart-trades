@@ -143,8 +143,17 @@ def sma(values, length):
     return out
 
 
-def fetch_candles(symbol, lookback_days=None, limit=500):
+def fetch_candles(symbol, lookback_days=None, limit=None):
     lookback_days = lookback_days if lookback_days is not None else (300 if RESOLUTION == "D" else 14)
+    if limit is None:
+        # Stocks only trade ~6.5hrs on weekdays, unlike crypto's 24/7, but
+        # intraday resolutions can still exceed a flat 500 over a wider
+        # lookback, the same silent-truncation-to-stale-data bug crypto
+        # hit. 5Min specifically needs ~780 bars over the default 14-day
+        # window, well past 500.
+        bars_per_trading_day = {"1Min": 390, "5Min": 78, "15Min": 26, "1Hour": 7, "1Day": 1}.get(ALPACA_TIMEFRAME, 26)
+        trading_days = lookback_days * 5 / 7  # weekdays only, margin below covers holidays etc
+        limit = min(10000, int(trading_days * bars_per_trading_day * 1.2))
     start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get(
         f"https://data.alpaca.markets/v2/stocks/{symbol}/bars",
@@ -1090,6 +1099,9 @@ def send_alert(symbol, snapshot, verdict, halal_screened=True):
     header = f"[{ALPACA_TIMEFRAME} chart, checked {fetched_at}, Alpaca free tier is ~15min delayed]"
     if direction:
         header += f"\n[{direction.capitalize()} technical trigger]"
+    price = snapshot.get("close")
+    if price is not None:
+        header += f"\nPrice: ${price:,.2f}"
     header += "\n\n"
     if not halal_screened:
         header += f"WARNING: {symbol} is NOT on your halal-screened watchlist. This is a one-off forced check only, treat it as informational, not a vetted call.\n\n"
