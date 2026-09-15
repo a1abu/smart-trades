@@ -890,12 +890,32 @@ conclusion," no "it's worth noting," no "at the end of the day," no
 throat-clearing before the point. Say the thing directly."""
 
 
+_ERROR_LIKE_PATTERNS = [
+    r"i'?m sorry,? (i|but)",
+    r"i apologize",
+    r"i cannot (process|complete|assist|help)",
+    r"i am unable to",
+    r"as an ai( language model)?",
+    r"an error (has )?occurred",
+    r"internal (server )?error",
+    r"^error:",
+]
+
+
 def _sanity_check(content):
-    """A real answer is more than a few characters. Catches malformed or
-    truncated responses that return HTTP 200 but garbage content, so
-    that can't silently poison what an Arbiter or Chief Arbiter reads."""
+    """A real answer is more than a few characters, and isn't itself an
+    error or refusal message that happened to come back with HTTP 200,
+    a real, documented failure mode: a provider under load can return a
+    200 with an apologetic error string in the body instead of a proper
+    4xx/5xx, which would otherwise sail through as a normal response and
+    never trigger the fallback chain at all, since no exception gets
+    raised for it."""
     if not content or len(content.strip()) < 20:
         raise ValueError(f"suspiciously short/empty response: {content!r}")
+    head = content.strip().lower()[:200]
+    for pattern in _ERROR_LIKE_PATTERNS:
+        if re.search(pattern, head):
+            raise ValueError(f"response looks like an error/refusal message, not real analysis: {content[:150]!r}")
     return content
 
 
