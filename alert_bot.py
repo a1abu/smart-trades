@@ -371,13 +371,15 @@ def compute_technical_context(fetch_symbol, is_crypto, source="alpaca"):
     if not candles or len(candles.get("c", [])) < LONG_TREND_LEN + 1:
         return {"note": "not enough price history for extended technical context (support/resistance, ATR, long-term trend)"}
 
-    closes, highs, lows = candles["c"], candles["h"], candles["l"]
+    closes, highs, lows, volumes = candles["c"], candles["h"], candles["l"], candles["v"]
     resistance = max(highs[-LEVELS_LEN:])
     support = min(lows[-LEVELS_LEN:])
     atr14 = atr(highs, lows, closes, ATR_LEN)
     ema_long = ema(closes, LONG_TREND_LEN)[-1]
 
     return {
+        "recent_closes": [round(c, 4) for c in closes[-LEVELS_LEN:]],
+        "recent_volumes": [round(v, 2) for v in volumes[-LEVELS_LEN:]],
         "resistance": round(resistance, 2),
         "support": round(support, 2),
         f"atr{ATR_LEN}": round(atr14, 2) if atr14 is not None else None,
@@ -645,6 +647,43 @@ def fetch_seat_search(symbol, is_crypto):
         return f"(independent search unavailable: {e})"
 
 
+def fetch_earnings_and_peer_context(symbol, is_crypto):
+    """Three targeted searches the generic news query doesn't cover:
+    when the next earnings report lands, how this stock's valuation
+    compares to its sector/peers, and sector/industry news specifically,
+    distinct from company-specific news and from generic macro. Skipped
+    for crypto, none of these concepts apply there. Uses Tavily's
+    general topic, not news, since earnings dates and peer comparisons
+    are often evergreen or forward-looking facts, not something
+    published in the last few days, sector news specifically still
+    benefits from a recency lean, handled per-search below."""
+    if is_crypto:
+        empty = "Not applicable, crypto has no earnings calendar, peer P/E comparison, or equity sector."
+        return {"earnings": empty, "peers": empty, "sector_news": empty}
+
+    def _search(query, topic="general", days=None):
+        try:
+            payload = {"query": query, "topic": topic, "max_results": 3, "search_depth": "advanced"}
+            if days:
+                payload["days"] = days
+            r = requests.post(
+                "https://api.tavily.com/search",
+                headers={"Authorization": f"Bearer {TAVILY_KEY}"},
+                json=payload,
+                timeout=20,
+            )
+            r.raise_for_status()
+            results = r.json().get("results", [])
+            return "\n".join(f"- {x['title']}: {x['content'][:300]}" for x in results) or "no results found"
+        except Exception as e:
+            return f"(search unavailable: {e})"
+
+    earnings = _search(f"{symbol} next earnings date estimate")
+    peers = _search(f"{symbol} sector average P/E valuation comparison peers")
+    sector_news = _search(f"{symbol} industry sector news trends", topic="news", days=14)
+    return {"earnings": earnings, "peers": peers, "sector_news": sector_news}
+
+
 def fetch_macro_context():
     """Fetched once per cron cycle, not per ticker, since broad macro
     conditions don't change ticker to ticker. GDELT for broad
@@ -670,7 +709,7 @@ def fetch_macro_context():
     return "\n".join(parts) if parts else "No macro context available."
 
 
-def build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search_block, macro_block, is_crypto):
+def build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search_block, macro_block, is_crypto, earnings_peer_block="No earnings/peer context available."):
     if is_crypto:
         weighting = "This is a crypto asset, traditional fundamentals like P/E or debt ratios don't apply. Weigh the technical picture and the news/macro backdrop together, genuinely together, neither one primary."
     else:
@@ -696,9 +735,19 @@ present, these are real computed levels, not estimates, use them. The
 which of the three conditions triggered and how many bars ago, use it
 directly, don't guess at or restate this differently. This explains why
 you're looking right now, it is not, on its own, more important than
-the fundamentals below.)
+the fundamentals below. "recent_closes" and "recent_volumes" are the
+actual last {LEVELS_LEN} bars, oldest first, newest last, a real
+sequence, not just a summary. Read it the way you'd read a chart:
+is price grinding up, down, or choppy across these bars, is the move
+concentrated in the most recent few or gradual across all of them, is
+volume rising or fading alongside price. Don't just cite the single
+current close/EMA/RSI number without looking at the shape behind it.)
 
 Fundamentals: {json.dumps(fundamentals)}
+
+Earnings timing and sector/peer valuation context, from targeted search,
+not the generic news query below:
+{earnings_peer_block}
 
 Recent news, last 7 days:
 {news_block}
@@ -717,13 +766,23 @@ weigh that the lightest of everything given:
 {past_block}
 
 Rules:
+- If earnings are imminent, that's a real risk specifically for
+day-trade and swing-trade, a report can move price independent of the
+technical setup. And a P/E or valuation multiple means little in
+isolation, use the peer/sector comparison to say whether it's actually
+high, low, or normal for this stock specifically, not just cite the raw
+number.
 - Every one of the four timeframe verdicts below must be grounded in
-BOTH the technical picture AND the fundamentals (or news/macro for
-crypto), not just one. A day-trade call reasoning purely on technicals
-while ignoring the fundamentals is incomplete, so is a long-term call
-that ignores the technical picture entirely. Don't let either side get
-crowded out at any single horizon, that includes day-trade and
-long-term specifically, not just the middle two.
+the technical picture, the fundamentals, AND relevant news or events
+(or macro for crypto), not just technicals and fundamentals. News being
+quiet is itself a fact worth stating plainly, "no material company or
+sector news found" is a legitimate, honest thing to say, silently
+dropping the dimension because nothing came up is not. A day-trade call
+reasoning purely on technicals while ignoring fundamentals and news is
+incomplete, so is a long-term call that ignores the technical picture
+entirely. Don't let any of the three get crowded out at any single
+horizon, that includes day-trade and long-term specifically, not just
+the middle two.
 - Consider both the company-specific (micro) picture and the broader
 macro backdrop above, don't reason about {symbol} in isolation from the
 environment it's trading in, but don't force a macro angle in either if
@@ -745,8 +804,8 @@ supports that for all four.
 Structure your answer exactly like this, one line per label, plain text
 after each colon, no markdown formatting:
 
-BULL CASE: [2-3 sentences, must cite at least one technical fact AND one fundamental fact, not just one side]
-BEAR CASE: [2-3 sentences, must cite at least one technical fact AND one fundamental fact, not just one side]
+BULL CASE: [2-3 sentences, must cite at least one technical fact, one fundamental fact, AND relevant news/event context if any exists, not just two of the three]
+BEAR CASE: [2-3 sentences, must cite at least one technical fact, one fundamental fact, AND relevant news/event context if any exists, not just two of the three]
 DAY-TRADE: [BUY, HOLD, or SELL, exactly one word, next few hours to one day]
 SWING-TRADE: [BUY, HOLD, or SELL, exactly one word, next few days to about two weeks]
 SHORT-TERM: [BUY, HOLD, or SELL, exactly one word, next few weeks to about two months]
@@ -787,7 +846,7 @@ DAY-TRADE: [BUY, HOLD, or SELL, exactly one word]
 SWING-TRADE: [BUY, HOLD, or SELL, exactly one word]
 SHORT-TERM: [BUY, HOLD, or SELL, exactly one word]
 LONG-TERM: [BUY, HOLD, or SELL, exactly one word]
-REASON: [2-3 sentences, citing the specific evidence that decided the SWING-TRADE ruling specifically]"""
+REASON: [2-3 sentences, citing the specific technical, fundamental, AND news/event evidence, whichever actually applies, that decided the SWING-TRADE ruling specifically]"""
 
 
 def build_factcheck_prompt(symbol, snapshot, fundamentals, team1_ruling, team2_ruling, search_block):
@@ -842,7 +901,12 @@ Check at most the 5 most consequential claims, the ones the verdict
 actually leans on. Keep each block short."""
 
 
-def build_chief_arbiter_prompt(symbol, team1_ruling, team2_ruling, factcheck_report):
+def build_chief_arbiter_prompt(symbol, team1_ruling, team2_ruling, factcheck_report, snapshot, fundamentals, news_block, macro_block, earnings_peer_data, past_block, is_crypto):
+    peer_line = "Not applicable, crypto has no P/E or sector peers." if is_crypto else earnings_peer_data.get("peers", "no data")
+    earnings_line = "Not applicable, crypto has no earnings calendar." if is_crypto else earnings_peer_data.get("earnings", "no data")
+    sector_line = "Not applicable, crypto has no equity sector." if is_crypto else earnings_peer_data.get("sector_news", "no data")
+    fundamentals_line = "Not applicable, crypto has no P/E, debt ratios, or similar." if is_crypto else json.dumps(fundamentals)
+
     return f"""You're the Chief Arbiter for {symbol}, a long-only, halal-compliant
 trade alert. Two independent teams each reached their own ruling across
 four timeframes, day-trade, swing-trade, short-term, and long-term. A
@@ -859,6 +923,19 @@ Team 2 ruling:
 Fact-check report:
 {factcheck_report}
 
+You also have direct access to the same raw data the teams worked from,
+not just their write-ups, use it to fill the dedicated sections below
+accurately rather than trying to reconstruct them from the team text:
+
+Technical snapshot: {json.dumps(snapshot)}
+Fundamentals: {fundamentals_line}
+Company news, last 7 days: {news_block}
+Sector/industry news: {sector_line}
+Next earnings: {earnings_line}
+Sector/peer valuation comparison: {peer_line}
+Macro backdrop: {macro_block}
+Similar past situations, with graded outcomes where available: {past_block}
+
 WRONG and UNVERIFIABLE are not the same thing, don't treat them alike.
 A claim marked WRONG carries real weight against whatever team made it,
 it's been actively contradicted by live search. A claim marked
@@ -871,23 +948,51 @@ core basis of a team's case for a given timeframe, let that change your
 verdict for that timeframe specifically, it doesn't have to change all
 four the same way.
 
-Structure your answer exactly like this, one line per label, plain text
-after each colon, no markdown formatting. The four verdicts must come
-first, in this order:
+For every section below, if the underlying data genuinely has nothing
+relevant, say so plainly, "no material news found," "no graded past
+situations yet," and similar. That's a real, useful answer. Don't
+invent content to fill a label, and don't skip a label either.
+
+Structure your answer exactly like this, one line or block per label,
+plain text after each colon, no markdown formatting. The four verdicts
+come first, in this order:
 
 DAY-TRADE: [BUY, HOLD, or SELL, exactly one word]
 SWING-TRADE: [BUY, HOLD, or SELL, exactly one word]
 SHORT-TERM: [BUY, HOLD, or SELL, exactly one word]
 LONG-TERM: [BUY, HOLD, or SELL, exactly one word]
-REASON: [2-3 sentences, citing the specific evidence that tipped the SWING-TRADE call, and noting if another timeframe genuinely differs and why]
+
+DAY-TRADE REASON: [1-2 sentences, the specific evidence that decided this call]
+SWING-TRADE REASON: [1-2 sentences, the specific evidence that decided this call]
+SHORT-TERM REASON: [1-2 sentences, the specific evidence that decided this call]
+LONG-TERM REASON: [1-2 sentences, the specific evidence that decided this call]
+
+TECHNICAL SUMMARY: [1-2 sentences, plain-English read of price vs EMA50/EMA200, RSI, and overall technical picture]
+KEY LEVELS: [the actual numbers: support, resistance, EMA50, EMA200]
+VOLUME ANALYSIS: [1-2 sentences, is volume confirming or diverging from the price move, above or below average]
+
+FUNDAMENTALS SUMMARY: [1-2 sentences, plain read of the valuation/ratio numbers]
+PEER COMPARISON: [1-2 sentences, how this stacks against sector/peers, not just the raw number alone]
+
+COMPANY NEWS: [1-2 sentences on company-specific news, or "no material company news found"]
+SECTOR NEWS: [1-2 sentences on sector/industry news, or "no material sector news found"]
+UPCOMING EVENTS: [next earnings date if known, or "none identified"]
+MACRO CONTEXT: [1-2 sentences on relevant broader conditions, or "no directly relevant macro factors"]
+
+RISKS TO WATCH: [1-2 sentences, concrete catalysts that could invalidate the call regardless of direction, distinct from the bear case itself]
+PAST TRACK RECORD: [1-2 sentences, how similar past situations for this ticker actually graded, citing real numbers if available, or "no graded history yet for a similar setup"]
+CONFIDENCE LEVEL: [one compact line covering all four timeframes, e.g. "Day-trade: contested. Swing-trade: strong consensus. Short-term: contested. Long-term: strong consensus."]
+
 TEAMS: [where the two teams agreed or disagreed, and why]
 FACT-CHECK: [what was CONFIRMED, WRONG, or UNVERIFIABLE, and whether it changed any of the four verdicts]
 
 Style: this is the only text a person actually reads, on their phone,
-right now. Write plainly within each label. Never use em dashes, use a
-period or comma instead. Skip AI-cliché phrasing entirely, no "in
-conclusion," no "it's worth noting," no "at the end of the day," no
-throat-clearing before the point. Say the thing directly."""
+right now. Write plainly within each label, keep each section genuinely
+brief, this is a lot of sections, don't let any single one sprawl.
+Never use em dashes, use a period or comma instead. Skip AI-cliché
+phrasing entirely, no "in conclusion," no "it's worth noting," no "at
+the end of the day," no throat-clearing before the point. Say the thing
+directly."""
 
 
 _ERROR_LIKE_PATTERNS = [
@@ -1042,10 +1147,12 @@ def _call_member(member, prompt, seen_models=None):
     return call_with_fallback(prompt, member["model"], key_id=key_id, role_name=member["name"])
 
 
-def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_crypto=False, macro_block=None):
+def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_crypto=False, macro_block=None, earnings_peer_data=None):
     news_block = _build_news_block(news)
     past_block = _build_past_block(similar_past)
     macro_block = macro_block or "No macro context available."
+    earnings_peer_data = earnings_peer_data or {"earnings": "not fetched", "peers": "not fetched", "sector_news": "not fetched"}
+    earnings_peer_block = f"Next earnings:\n{earnings_peer_data['earnings']}\n\nSector/peer valuation comparison:\n{earnings_peer_data['peers']}"
 
     all_opinions = {}
     team_rulings = {}
@@ -1056,7 +1163,7 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
         for role in ("analyst", "reviewer"):
             member = team[role]
             own_search = fetch_seat_search(symbol, is_crypto)
-            prompt = build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search, macro_block, is_crypto)
+            prompt = build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search, macro_block, is_crypto, earnings_peer_block)
             try:
                 text = _call_member(member, prompt, seen_models=seen_models)
             except Exception as e:
@@ -1094,7 +1201,7 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
     all_opinions["Fact-checker (Nemotron 3 Ultra)"] = factcheck_report
 
     try:
-        chief_prompt = build_chief_arbiter_prompt(symbol, t1, t2, factcheck_report)
+        chief_prompt = build_chief_arbiter_prompt(symbol, t1, t2, factcheck_report, snapshot, fundamentals, news_block, macro_block, earnings_peer_data, past_block, is_crypto)
         chief_key = (CHIEF_ARBITER_KEY, CHIEF_ARBITER_MODEL)
         if chief_key in seen_models:
             print("Chief Arbiter model already called on this key earlier this run, pausing 10s", file=sys.stderr)
@@ -1258,12 +1365,13 @@ def analyze():
         snapshot = {**snapshot, **tech_context}
         fundamentals = fetch_fundamentals(symbol, is_crypto=is_crypto)
         news = fetch_news(symbol, is_crypto=is_crypto)
+        earnings_peer_data = fetch_earnings_and_peer_context(symbol, is_crypto)
 
         text = situation_text(symbol, snapshot, fundamentals, news)
         similar_past = retrieve_similar(text, memory)
         print(f"{symbol}: found {len(similar_past)} similar past situations in memory")
 
-        verdict, opinions = run_council(symbol, snapshot, fundamentals, news, similar_past=similar_past, is_crypto=is_crypto, macro_block=macro_block)
+        verdict, opinions = run_council(symbol, snapshot, fundamentals, news, similar_past=similar_past, is_crypto=is_crypto, macro_block=macro_block, earnings_peer_data=earnings_peer_data)
         send_alert(symbol, snapshot, verdict, halal_screened=halal_screened)
 
         memory = add_to_memory(memory, symbol, text, verdict, snapshot.get("close"), is_crypto, fetch_symbol=fetch_symbol, source=source, trigger_direction=snapshot.get("trigger_direction"))
