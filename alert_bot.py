@@ -527,24 +527,89 @@ def situation_text(symbol, snapshot, fundamentals, news):
     return f"{symbol}: close {snapshot.get('close')}, RSI {snapshot.get('rsi14')}, volume {snapshot.get('volume')} vs avg {snapshot.get('vol_avg20')}. Fundamentals: {json.dumps(fundamentals)}. News: {titles}"
 
 
-def retrieve_similar(text, memory, top_k=RAG_TOP_K):
+STATS_K = 10  # graded neighbors used for the track-record numbers
+# Below this best-match similarity, treat the situation as novel. Derived
+# from the stored embeddings themselves: only ~1% of entries had a best
+# match this weak against the rest of memory. Tunable as memory grows.
+LOW_SIMILARITY = 0.75
+
+
+def _entry_graded(entry):
+    return any(d.get("checked") for d in (entry.get("outcomes") or {}).values())
+
+
+def _entry_swing_wrong(entry):
+    return any(
+        d.get("checked") and _swing_grade(d) is False
+        for d in (entry.get("outcomes") or {}).values()
+    )
+
+
+def _cluster_stats(entries):
+    """Hard accuracy numbers over a set of graded past entries, same
+    arithmetic stats() does, scoped to just the retrieved neighbors.
+    Old-schema entries only ever carried a swing-trade-equivalent grade."""
+    timeframes = ("day_trade", "swing_trade", "short_term")
+    tally = {tf: [0, 0] for tf in timeframes}
+    for e in entries:
+        for data in (e.get("outcomes") or {}).values():
+            if not data.get("checked"):
+                continue
+            grades = data.get("grades")
+            if grades:
+                for tf in timeframes:
+                    if grades.get(tf) is True:
+                        tally[tf][0] += 1
+                    elif grades.get(tf) is False:
+                        tally[tf][1] += 1
+            else:
+                g = data.get("correct")
+                if g is True:
+                    tally["swing_trade"][0] += 1
+                elif g is False:
+                    tally["swing_trade"][1] += 1
+    return {"situations": len(entries), "tally": tally}
+
+
+def retrieve_memory_context(text, memory, symbol=None, top_k=RAG_TOP_K):
+    """Similarity retrieval plus the extras that make it actually useful:
+    the top_k most similar entries as before, hard accuracy numbers over
+    the most similar GRADED entries, the closest past situation that
+    graded wrong, and the best similarity score so a novel setup can be
+    flagged. If embedding retrieval breaks, falls back to the most recent
+    entries for the same ticker instead of returning nothing."""
+    ctx = {"similar": [], "closest_wrong": None, "closest_wrong_sim": None,
+           "cluster_stats": None, "best_similarity": None, "fallback": False}
     if not memory:
-        return []
+        return ctx
+
     try:
         import numpy as np
         model = _get_model()
         query_emb = model.encode(text)
-        scored = []
+        ranked = []
         for entry in memory:
             past_emb = np.array(entry["embedding"])
             denom = (np.linalg.norm(query_emb) * np.linalg.norm(past_emb)) or 1e-9
-            sim = float(np.dot(query_emb, past_emb) / denom)
-            scored.append((sim, entry))
-        scored.sort(key=lambda x: -x[0])
-        return [e for _, e in scored[:top_k]]
+            ranked.append((float(np.dot(query_emb, past_emb) / denom), entry))
+        ranked.sort(key=lambda x: -x[0])
+        ctx["best_similarity"] = ranked[0][0]
     except Exception as e:
-        print(f"RAG retrieval failed ({e}), proceeding without memory context", file=sys.stderr)
-        return []
+        print(f"RAG retrieval failed ({e}), falling back to most recent entries for {symbol}", file=sys.stderr)
+        pool = [en for en in memory if symbol is None or en.get("symbol") == symbol]
+        pool.sort(key=lambda en: en.get("timestamp", ""), reverse=True)
+        ranked = [(None, en) for en in pool]
+        ctx["fallback"] = True
+
+    ctx["similar"] = [en for _, en in ranked[:top_k]]
+    graded = [(s, en) for s, en in ranked if _entry_graded(en)]
+    ctx["cluster_stats"] = _cluster_stats([en for _, en in graded[:STATS_K]])
+    for s, en in graded:
+        if _entry_swing_wrong(en):
+            ctx["closest_wrong"] = en
+            ctx["closest_wrong_sim"] = s
+            break
+    return ctx
 
 
 def add_to_memory(memory, symbol, text, verdict, close_at_alert, is_crypto, fetch_symbol=None, source="alpaca", trigger_direction=None):
@@ -600,28 +665,69 @@ def _swing_grade(outcome_data):
     return outcome_data.get("correct")
 
 
+def _format_past_entry(e):
+    direction_tag = f" [{e['trigger_direction']} setup]" if e.get("trigger_direction") else ""
+    line = f"- {e['timestamp'][:10]}{direction_tag}: {e['text'][:200]} -> verdict was: {e['verdict'][:150]}"
+    graded_parts = []
+    for h, data in (e.get("outcomes") or {}).items():
+        if not data.get("checked"):
+            continue
+        swing_correct = _swing_grade(data)
+        result = "CORRECT" if swing_correct else "WRONG" if swing_correct is False else "ungraded"
+        pct = data.get("pct_change")
+        part = f"{h}: {result} ({magnitude_label(pct)} {pct:+.1f}%)" if pct is not None else f"{h}: {result}"
+        if data.get("reflection"):
+            part += f" [why: {data['reflection'][:150]}]"
+        graded_parts.append(part)
+    if graded_parts:
+        line += " | GRADED OUTCOMES -> " + "; ".join(graded_parts)
+    return line
+
+
+def _format_cluster_stats(stats):
+    if not stats or stats["situations"] == 0:
+        return "TRACK RECORD: no graded past situations yet, no real accuracy numbers to report."
+    parts = []
+    for tf, (c, w) in stats["tally"].items():
+        name = tf.replace("_", "-")
+        total = c + w
+        parts.append(f"{name} right {c} of {total} ({c / total * 100:.0f}%)" if total else f"{name} no graded data")
+    return (
+        f"TRACK RECORD, computed from real graded outcomes of the {stats['situations']} most similar graded past situations: "
+        + ", ".join(parts)
+        + ". One situation is checked at several horizons, so these counts overlap, don't read them as fully independent tests."
+    )
+
+
 def _build_past_block(similar_past):
-    if not similar_past:
+    # Accepts the new context dict, or a plain list of entries (older callers).
+    ctx = similar_past if isinstance(similar_past, dict) else {"similar": similar_past or []}
+    similar = ctx.get("similar") or []
+    if not similar:
         return "No similar past situations in memory yet."
-    past_lines = []
-    for e in similar_past:
-        direction_tag = f" [{e['trigger_direction']} setup]" if e.get("trigger_direction") else ""
-        line = f"- {e['timestamp'][:10]}{direction_tag}: {e['text'][:200]} -> verdict was: {e['verdict'][:150]}"
-        graded_parts = []
-        for h, data in (e.get("outcomes") or {}).items():
-            if not data.get("checked"):
-                continue
-            swing_correct = _swing_grade(data)
-            result = "CORRECT" if swing_correct else "WRONG" if swing_correct is False else "ungraded"
-            pct = data.get("pct_change")
-            part = f"{h}: {result} ({magnitude_label(pct)} {pct:+.1f}%)" if pct is not None else f"{h}: {result}"
-            if data.get("reflection"):
-                part += f" [why: {data['reflection'][:150]}]"
-            graded_parts.append(part)
-        if graded_parts:
-            line += " | GRADED OUTCOMES -> " + "; ".join(graded_parts)
-        past_lines.append(line)
-    return "\n".join(past_lines)
+
+    lines = []
+    best = ctx.get("best_similarity")
+    if ctx.get("fallback"):
+        lines.append("NOTE: similarity search was unavailable this run, these are the most recent past situations for this ticker, not necessarily similar ones.")
+    elif best is not None and best < LOW_SIMILARITY:
+        lines.append(f"NOTE: even the closest past situation is only {best:.2f} similar, this system hasn't seen a close match to this setup before, treat everything below as weak evidence.")
+
+    if "cluster_stats" in ctx:
+        lines.append(_format_cluster_stats(ctx["cluster_stats"]))
+
+    wrong = ctx.get("closest_wrong")
+    if wrong is not None:
+        sim = ctx.get("closest_wrong_sim")
+        sim_note = f"similarity {sim:.2f}" if sim is not None else "most recent for this ticker"
+        if any(wrong is s for s in similar):
+            lines.append(f"CLOSEST PAST SITUATION THAT GRADED WRONG is already listed below ({wrong['timestamp'][:10]}, {sim_note}), pay particular attention to why it failed.")
+        else:
+            lines.append(f"CLOSEST PAST SITUATION THAT GRADED WRONG ({sim_note}):\n{_format_past_entry(wrong)}")
+
+    lines.append("MOST SIMILAR PAST SITUATIONS:" if not ctx.get("fallback") else "MOST RECENT PAST SITUATIONS FOR THIS TICKER:")
+    lines.extend(_format_past_entry(e) for e in similar)
+    return "\n".join(lines)
 
 
 def fetch_seat_search(symbol, is_crypto):
@@ -1368,10 +1474,11 @@ def analyze():
         earnings_peer_data = fetch_earnings_and_peer_context(symbol, is_crypto)
 
         text = situation_text(symbol, snapshot, fundamentals, news)
-        similar_past = retrieve_similar(text, memory)
-        print(f"{symbol}: found {len(similar_past)} similar past situations in memory")
+        memory_ctx = retrieve_memory_context(text, memory, symbol=symbol)
+        note = " (fallback: most recent for this ticker)" if memory_ctx["fallback"] else ""
+        print(f"{symbol}: found {len(memory_ctx['similar'])} similar past situations in memory{note}")
 
-        verdict, opinions = run_council(symbol, snapshot, fundamentals, news, similar_past=similar_past, is_crypto=is_crypto, macro_block=macro_block, earnings_peer_data=earnings_peer_data)
+        verdict, opinions = run_council(symbol, snapshot, fundamentals, news, similar_past=memory_ctx, is_crypto=is_crypto, macro_block=macro_block, earnings_peer_data=earnings_peer_data)
         send_alert(symbol, snapshot, verdict, halal_screened=halal_screened)
 
         memory = add_to_memory(memory, symbol, text, verdict, snapshot.get("close"), is_crypto, fetch_symbol=fetch_symbol, source=source, trigger_direction=snapshot.get("trigger_direction"))
