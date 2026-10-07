@@ -74,6 +74,20 @@ RAG_TOP_K = 3
 # long-term, or the reverse, one checkpoint conflates those.
 HORIZONS = {"3d": 3, "7d": 7, "14d": 14, "30d": 30, "60d": 60, "90d": 90}
 
+# One source of truth for what BUY / HOLD / SELL mean, shared by the
+# grader and by the prompts so the models are told the bar they get
+# graded on. BUY is right if price rose more than BUY_SELL_PCT, SELL if it
+# fell more than that, HOLD if it moved less than HOLD_PCT either way.
+BUY_SELL_PCT = 1.5
+HOLD_PCT = 3.0
+VERDICT_DEFINITIONS = f"""What the three verdicts mean, and how they get graded:
+- BUY: you expect price to rise by more than {BUY_SELL_PCT}% over that timeframe.
+- SELL: you expect price to fall by more than {BUY_SELL_PCT}% over that timeframe.
+- HOLD: you expect price to stay within {HOLD_PCT}% either way, no strong move.
+Pick the verdict that matches the move you actually expect, not the one
+that feels safest. Don't default to HOLD when you expect a real move, and
+don't force BUY or SELL when you expect a quiet stretch."""
+
 # Two independent teams, each Analyst and Reviewer gets the same base
 # context and does its own live search, reasoning entirely on its own,
 # no artificial role-splitting between them. Each team's Arbiter
@@ -928,6 +942,8 @@ time, or the reverse. Give each timeframe its own honest verdict, don't
 default to repeating the same call four times unless the data genuinely
 supports that for all four.
 
+{VERDICT_DEFINITIONS}
+
 Structure your answer exactly like this, one line per label, plain text
 after each colon, no markdown formatting:
 
@@ -937,6 +953,7 @@ DAY-TRADE: [BUY, HOLD, or SELL, exactly one word, next few hours to one day]
 SWING-TRADE: [BUY, HOLD, or SELL, exactly one word, next few days to about two weeks]
 SHORT-TERM: [BUY, HOLD, or SELL, exactly one word, next few weeks to about two months]
 LONG-TERM: [BUY, HOLD, or SELL, exactly one word, several months and beyond]
+EXPECTED MOVE: [your expected percent change for each timeframe, for example: day-trade +0.5%, swing-trade +2%, short-term +4%, long-term +10%]
 REASON: [1-2 sentences, combining the technical and fundamental fact that most drove the SWING-TRADE call specifically]"""
 
 
@@ -951,6 +968,8 @@ per timeframe for your team, don't just average them, weigh which one's
 argument is actually better supported by real evidence, and do this
 independently for each timeframe, they don't all have to resolve the
 same way.
+
+{VERDICT_DEFINITIONS}
 
 If BOTH the Analyst's and Reviewer's takes below are error messages or
 otherwise contain no real analysis, you have no basis for an opinion on
@@ -1069,6 +1088,8 @@ it's been actively contradicted by live search. A claim marked
 UNVERIFIABLE just means the search didn't cover it, that's neutral,
 not evidence against the team that made it. Don't punish a team for a
 claim search simply couldn't check.
+
+{VERDICT_DEFINITIONS}
 
 Don't just average the two team rulings. If a WRONG claim undercuts the
 core basis of a team's case for a given timeframe, let that change your
@@ -1640,6 +1661,52 @@ def stats():
     for direction, d in per_direction.items():
         print(f"  {direction}: {rate_str(d['correct'], d['wrong'])}")
 
+    _print_verdict_distribution(memory)
+
+
+def _print_verdict_distribution(memory):
+    """How often each verdict is GIVEN (not whether it was right), per
+    timeframe, split by trigger direction and by recent vs all time.
+    Spots a skew toward HOLD/SELL, and counts entries where the pipeline
+    itself failed (those rule HOLD by default, not by analysis)."""
+    labels = ("day_trade", "swing_trade", "short_term", "long_term")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+
+    def tally(entries):
+        t = {lab: {"BUY": 0, "HOLD": 0, "SELL": 0} for lab in labels}
+        for e in entries:
+            v = parse_all_verdicts(e.get("verdict"))
+            for lab in labels:
+                if v[lab] in t[lab]:
+                    t[lab][v[lab]] += 1
+        return t
+
+    def show(title, entries):
+        print(f"\n{title} ({len(entries)} entries):")
+        if not entries:
+            print("  none")
+            return
+        t = tally(entries)
+        for lab in labels:
+            n = sum(t[lab].values())
+            if not n:
+                print(f"  {lab.replace('_', '-')}: no parsed verdicts")
+                continue
+            parts = ", ".join(f"{k} {v} ({v / n * 100:.0f}%)" for k, v in t[lab].items())
+            print(f"  {lab.replace('_', '-')}: {parts}")
+
+    print("\n=== Verdict distribution (how often each call is given) ===")
+    failed = [e for e in memory if _entry_pipeline_failure(e)]
+    print(f"Entries where the pipeline failed (HOLD by default, not analysis): {len(failed)} of {len(memory)}")
+    real = [e for e in memory if not _entry_pipeline_failure(e)]
+    show("All time, real verdicts only", real)
+    show("Last 30 days, real verdicts only", [e for e in real if e.get("timestamp", "") >= cutoff])
+    for direction in ("bullish", "bearish"):
+        show(f"Trigger {direction}, real verdicts only",
+             [e for e in real if e.get("trigger_direction") == direction])
+    show("Trigger direction not recorded (older entries), real verdicts only",
+         [e for e in real if not e.get("trigger_direction")])
+
 
 def parse_all_verdicts(verdict_text):
     """Extract all four timeframe calls from the current prompt format.
@@ -1689,7 +1756,7 @@ def parse_verdict_direction(verdict_text):
     return parse_all_verdicts(verdict_text)["swing_trade"]
 
 
-def grade_verdict(direction, pct_change, buy_sell_threshold=1.5, hold_threshold=3.0):
+def grade_verdict(direction, pct_change, buy_sell_threshold=BUY_SELL_PCT, hold_threshold=HOLD_PCT):
     if direction == "BUY":
         return pct_change > buy_sell_threshold
     if direction == "SELL":
