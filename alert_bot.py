@@ -69,24 +69,39 @@ WINDOW_BARS = 4
 MEMORY_FILE = "memory-repo/memory.json"
 RAG_TOP_K = 3
 
-# How many days after an alert to check whether the verdict held up.
-# Multiple horizons since a call can be right short-term and wrong
-# long-term, or the reverse, one checkpoint conflates those.
-HORIZONS = {"3d": 3, "7d": 7, "14d": 14, "30d": 30, "60d": 60, "90d": 90}
+# Each of the four verdict timeframes is graded only at its OWN checkpoints
+# (days after the alert), against the closing price on that date, with its
+# own BUY/SELL bar in percent. HOLD is right if price stays within
+# HOLD_BAR_MULT times the bar. Long-term needs 120+ days to test.
+TIMEFRAMES = {
+    "day_trade":   {"checkpoints": (1,),           "bar": 1.0, "label": "day-trade"},
+    "swing_trade": {"checkpoints": (3, 7, 14, 30), "bar": 3.0, "label": "swing-trade"},
+    "short_term":  {"checkpoints": (60, 90),       "bar": 3.0, "label": "short-term"},
+    "long_term":   {"checkpoints": (120, 180),     "bar": 5.0, "label": "long-term"},
+}
+HOLD_BAR_MULT = 2.0
+HORIZONS = {f"{d}d": d for d in sorted({d for t in TIMEFRAMES.values() for d in t["checkpoints"]})}
+CHECKPOINT_OWNER = {f"{d}d": tf for tf, t in TIMEFRAMES.items() for d in t["checkpoints"]}
+# Bump when the grading method changes. A stored grade without this exact
+# version came from an older method and is ignored, then recomputed by postcheck.
+GRADING_VERSION = 2
 
-# One source of truth for what BUY / HOLD / SELL mean, shared by the
-# grader and by the prompts so the models are told the bar they get
-# graded on. BUY is right if price rose more than BUY_SELL_PCT, SELL if it
-# fell more than that, HOLD if it moved less than HOLD_PCT either way.
-BUY_SELL_PCT = 1.5
-HOLD_PCT = 3.0
-VERDICT_DEFINITIONS = f"""What the three verdicts mean, and how they get graded:
-- BUY: you expect price to rise by more than {BUY_SELL_PCT}% over that timeframe.
-- SELL: you expect price to fall by more than {BUY_SELL_PCT}% over that timeframe.
-- HOLD: you expect price to stay within {HOLD_PCT}% either way, no strong move.
-Pick the verdict that matches the move you actually expect, not the one
-that feels safest. Don't default to HOLD when you expect a real move, and
-don't force BUY or SELL when you expect a quiet stretch."""
+
+def _window_text(cfg):
+    lo, hi = min(cfg["checkpoints"]), max(cfg["checkpoints"])
+    return f"{lo} day{'s' if lo != 1 else ''}" if lo == hi else f"{lo} to {hi} days"
+
+
+VERDICT_DEFINITIONS = (
+    "What the three verdicts mean, and how they get graded. Each timeframe has its own window and its own bar:\n"
+    + "\n".join(
+        f"- {t['label']} (judged {_window_text(t)} after the alert): BUY if you expect price to rise by more than {t['bar']:g}%, "
+        f"SELL if you expect it to fall by more than {t['bar']:g}%, HOLD if you expect it to stay within {t['bar'] * HOLD_BAR_MULT:g}% either way."
+        for t in TIMEFRAMES.values()
+    )
+    + "\nPick the verdict that matches the move you actually expect, not the one that feels safest. "
+    "Don't default to HOLD when you expect a real move, and don't force BUY or SELL when you expect a quiet stretch."
+)
 
 # Two independent teams, each Analyst and Reviewer gets the same base
 # context and does its own live search, reasoning entirely on its own,
@@ -249,6 +264,40 @@ def fetch_kraken_candles(pair, lookback_days=None):
         "l": [float(row[3]) for row in rows],
         "v": [float(row[6]) for row in rows],
     }
+
+
+def fetch_daily_history(fetch_symbol, is_crypto, source="alpaca", lookback_days=400):
+    """Daily closes with their dates, oldest first, as [(date, close)].
+    Independent of the live RESOLUTION setting, used by postcheck to grade a
+    call against the price on its own checkpoint date instead of whatever
+    the price is when postcheck happens to run. Returns [] on failure."""
+    start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    headers = {"APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+    try:
+        if is_crypto and source == "kraken":
+            r = requests.get("https://api.kraken.com/0/public/OHLC",
+                             params={"pair": fetch_symbol, "interval": 1440}, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("error"):
+                print(f"{fetch_symbol}: Kraken daily history error: {data['error']}", file=sys.stderr)
+                return []
+            rows = next((v for k, v in data.get("result", {}).items() if k != "last"), None) or []
+            return [(datetime.fromtimestamp(int(row[0]), tz=timezone.utc).date(), float(row[4])) for row in rows]
+        if is_crypto:
+            r = requests.get("https://data.alpaca.markets/v1beta3/crypto/us/bars", headers=headers, timeout=20,
+                             params={"symbols": fetch_symbol, "timeframe": "1Day", "start": start, "limit": 1000})
+            r.raise_for_status()
+            bars = r.json().get("bars", {}).get(fetch_symbol) or []
+        else:
+            r = requests.get(f"https://data.alpaca.markets/v2/stocks/{fetch_symbol}/bars", headers=headers, timeout=20,
+                             params={"timeframe": "1Day", "start": start, "limit": 1000, "feed": "iex", "adjustment": "raw"})
+            r.raise_for_status()
+            bars = r.json().get("bars") or []
+        return [(datetime.fromisoformat(b["t"].replace("Z", "+00:00")).date(), float(b["c"])) for b in bars]
+    except Exception as e:
+        print(f"{fetch_symbol}: daily history fetch failed ({e})", file=sys.stderr)
+        return []
 
 
 def fetch_crypto_by_source(ticker, lookback_days=14):
@@ -568,13 +617,20 @@ def _entry_pipeline_failure(entry):
             or "no analyst" in r or "process gap" in r or "abdicat" in r)
 
 
+def _slot_checked(data):
+    """A checkpoint counts as graded only if it was graded with the
+    current method. Older grades used the wrong price, so they're ignored
+    until postcheck recomputes them."""
+    return bool(data.get("checked")) and data.get("grading") == GRADING_VERSION
+
+
 def _entry_graded(entry):
-    return any(d.get("checked") for d in (entry.get("outcomes") or {}).values())
+    return any(_slot_checked(d) for d in (entry.get("outcomes") or {}).values())
 
 
 def _entry_swing_wrong(entry):
     return any(
-        d.get("checked") and _swing_grade(d) is False
+        _slot_checked(d) and _swing_grade(d) is False
         for d in (entry.get("outcomes") or {}).values()
     )
 
@@ -583,11 +639,11 @@ def _cluster_stats(entries):
     """Hard accuracy numbers over a set of graded past entries, same
     arithmetic stats() does, scoped to just the retrieved neighbors.
     Old-schema entries only ever carried a swing-trade-equivalent grade."""
-    timeframes = ("day_trade", "swing_trade", "short_term")
+    timeframes = tuple(TIMEFRAMES)
     tally = {tf: [0, 0] for tf in timeframes}
     for e in entries:
         for data in (e.get("outcomes") or {}).values():
-            if not data.get("checked"):
+            if not _slot_checked(data):
                 continue
             grades = data.get("grades")
             if grades:
@@ -605,6 +661,38 @@ def _cluster_stats(entries):
     return {"situations": len(entries), "tally": tally}
 
 
+MIN_DIRECTION_SAMPLE = 30  # graded calls needed per direction before its hit rate is quoted
+SELL_CAUTION_BELOW = 40    # SELL hit rate (%) under which the bearish note adds a caution
+
+
+def compute_direction_accuracy(memory):
+    """Live hit rate of the swing-trade call by direction (BUY/HOLD/SELL),
+    from every graded entry in memory, pipeline failures excluded. Computed
+    fresh on each run from the memory file already in hand, so it is never
+    stale and needs no separate scheduled job. One entry is graded at
+    several horizons, so the counts overlap, same as stats()."""
+    tally = {d: [0, 0] for d in ("BUY", "HOLD", "SELL")}
+    for entry in memory or []:
+        if _entry_pipeline_failure(entry):
+            continue
+        direction = parse_verdict_direction(entry.get("verdict"))
+        if direction not in tally:
+            continue
+        for data in (entry.get("outcomes") or {}).values():
+            if not _slot_checked(data):
+                continue
+            g = _swing_grade(data)
+            if g is True:
+                tally[direction][0] += 1
+            elif g is False:
+                tally[direction][1] += 1
+    result = {}
+    for d, (c, w) in tally.items():
+        n = c + w
+        result[d] = {"rate": (c / n * 100) if n else None, "n": n, "enough": n >= MIN_DIRECTION_SAMPLE}
+    return result
+
+
 def retrieve_memory_context(text, memory, symbol=None, top_k=RAG_TOP_K):
     """Similarity retrieval plus the extras that make it actually useful:
     the top_k most similar entries as before, hard accuracy numbers over
@@ -613,9 +701,15 @@ def retrieve_memory_context(text, memory, symbol=None, top_k=RAG_TOP_K):
     flagged. If embedding retrieval breaks, falls back to the most recent
     entries for the same ticker instead of returning nothing."""
     ctx = {"similar": [], "closest_wrong": None, "closest_wrong_sim": None,
-           "cluster_stats": None, "best_similarity": None, "fallback": False}
+           "cluster_stats": None, "best_similarity": None, "fallback": False,
+           "direction_accuracy": None}
     if not memory:
         return ctx
+
+    try:
+        ctx["direction_accuracy"] = compute_direction_accuracy(memory)
+    except Exception as e:
+        print(f"direction accuracy failed ({e}), prompts will go out without it", file=sys.stderr)
 
     try:
         import numpy as np
@@ -705,18 +799,48 @@ def _format_past_entry(e):
     line = f"- {e['timestamp'][:10]}{direction_tag}: {e['text'][:200]} -> verdict was: {e['verdict'][:150]}"
     graded_parts = []
     for h, data in (e.get("outcomes") or {}).items():
-        if not data.get("checked"):
+        if not _slot_checked(data):
             continue
-        swing_correct = _swing_grade(data)
-        result = "CORRECT" if swing_correct else "WRONG" if swing_correct is False else "ungraded"
+        owner = CHECKPOINT_OWNER.get(h)
+        correct = (data.get("grades") or {}).get(owner) if owner else None
+        result = "CORRECT" if correct else "WRONG" if correct is False else "ungraded"
+        name = TIMEFRAMES[owner]["label"] if owner else "call"
         pct = data.get("pct_change")
-        part = f"{h}: {result} ({magnitude_label(pct)} {pct:+.1f}%)" if pct is not None else f"{h}: {result}"
+        part = f"{h} {name}: {result} ({magnitude_label(pct)} {pct:+.1f}%)" if pct is not None else f"{h} {name}: {result}"
         if data.get("reflection"):
             part += f" [why: {data['reflection'][:150]}]"
         graded_parts.append(part)
     if graded_parts:
         line += " | GRADED OUTCOMES -> " + "; ".join(graded_parts)
     return line
+
+
+def _format_direction_accuracy(acc):
+    """One line of overall BUY/HOLD/SELL hit rates, only for directions
+    with enough graded calls to mean something."""
+    if not acc:
+        return None
+    parts = [f"{d} right {v['rate']:.0f}% ({v['n']} graded)" for d, v in acc.items() if v["enough"]]
+    if not parts:
+        return None
+    return ("OVERALL CALL ACCURACY (swing-trade call, all graded history, same setup or not): "
+            + ", ".join(parts)
+            + ". Checked at several horizons per call, so counts overlap.")
+
+
+def _bearish_note(acc):
+    """The bearish-trigger wording, built from live SELL accuracy. No
+    invitation to SELL; cautions against it only when the data says SELL
+    has actually been unreliable."""
+    base = "A bearish technical signal fired, price crossing below its average with RSI weakening and volume confirming. That's only a trigger to look, not evidence of anything on its own."
+    sell = (acc or {}).get("SELL")
+    if not sell or not sell["enough"]:
+        return base
+    rate = sell["rate"]
+    if rate < SELL_CAUTION_BELOW:
+        return (base + f" In this system's own graded track record, SELL calls have been right only about {rate:.0f}% of the time ({sell['n']} graded), "
+                "so a bearish trigger alone is not a reason to call SELL. Call SELL only if the fundamentals and news also point to a real drop beyond the SELL threshold below.")
+    return base + f" In this system's own graded track record, SELL calls have been right about {rate:.0f}% of the time ({sell['n']} graded)."
 
 
 def _format_cluster_stats(stats):
@@ -738,10 +862,13 @@ def _build_past_block(similar_past):
     # Accepts the new context dict, or a plain list of entries (older callers).
     ctx = similar_past if isinstance(similar_past, dict) else {"similar": similar_past or []}
     similar = ctx.get("similar") or []
+    accuracy_line = _format_direction_accuracy(ctx.get("direction_accuracy"))
     if not similar:
-        return "No similar past situations in memory yet."
+        return "No similar past situations in memory yet." + (f"\n{accuracy_line}" if accuracy_line else "")
 
     lines = []
+    if accuracy_line:
+        lines.append(accuracy_line)
     best = ctx.get("best_similarity")
     if ctx.get("fallback"):
         lines.append("NOTE: similarity search was unavailable this run, these are the most recent past situations for this ticker, not necessarily similar ones.")
@@ -850,7 +977,7 @@ def fetch_macro_context():
     return "\n".join(parts) if parts else "No macro context available."
 
 
-def build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search_block, macro_block, is_crypto, earnings_peer_block="No earnings/peer context available."):
+def build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search_block, macro_block, is_crypto, earnings_peer_block="No earnings/peer context available.", direction_accuracy=None):
     if is_crypto:
         weighting = "This is a crypto asset, traditional fundamentals like P/E or debt ratios don't apply. Weigh the technical picture and the news/macro backdrop together, genuinely together, neither one primary."
     else:
@@ -860,7 +987,7 @@ def build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block,
     if direction == "bullish":
         direction_note = "A bullish technical signal fired, price crossing above its average with RSI recovering and volume confirming. That's only a trigger to look, not evidence of anything on its own."
     else:
-        direction_note = "A bearish technical signal fired, price crossing below its average with RSI weakening and volume confirming. This system is long-only, it never shorts, but a bearish signal is still real, legitimate grounds for a SELL or HOLD call, don't discount it just because there's no short to act on. That's only a trigger to look, not evidence of anything on its own."
+        direction_note = _bearish_note(direction_accuracy)
 
     return f"""You are one of two independent analysts evaluating {symbol} for a
 long-only, halal-compliant trader. You're reasoning entirely on your
@@ -949,10 +1076,10 @@ after each colon, no markdown formatting:
 
 BULL CASE: [2-3 sentences, must cite at least one technical fact, one fundamental fact, AND relevant news/event context if any exists, not just two of the three]
 BEAR CASE: [2-3 sentences, must cite at least one technical fact, one fundamental fact, AND relevant news/event context if any exists, not just two of the three]
-DAY-TRADE: [BUY, HOLD, or SELL, exactly one word, next few hours to one day]
-SWING-TRADE: [BUY, HOLD, or SELL, exactly one word, next few days to about two weeks]
-SHORT-TERM: [BUY, HOLD, or SELL, exactly one word, next few weeks to about two months]
-LONG-TERM: [BUY, HOLD, or SELL, exactly one word, several months and beyond]
+DAY-TRADE: [BUY, HOLD, or SELL, exactly one word, about the next day]
+SWING-TRADE: [BUY, HOLD, or SELL, exactly one word, next few days to about a month]
+SHORT-TERM: [BUY, HOLD, or SELL, exactly one word, about two to three months]
+LONG-TERM: [BUY, HOLD, or SELL, exactly one word, four months and beyond]
 EXPECTED MOVE: [your expected percent change for each timeframe, for example: day-trade +0.5%, swing-trade +2%, short-term +4%, long-term +10%]
 REASON: [1-2 sentences, combining the technical and fundamental fact that most drove the SWING-TRADE call specifically]"""
 
@@ -1311,7 +1438,8 @@ def run_council(symbol, snapshot, fundamentals, news, similar_past=None, is_cryp
         for role in ("analyst", "reviewer"):
             member = team[role]
             own_search = fetch_seat_search(symbol, is_crypto)
-            prompt = build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search, macro_block, is_crypto, earnings_peer_block)
+            prompt = build_analyst_prompt(symbol, snapshot, fundamentals, news_block, past_block, own_search, macro_block, is_crypto, earnings_peer_block,
+                                          direction_accuracy=(similar_past.get("direction_accuracy") if isinstance(similar_past, dict) else None))
             try:
                 text = _call_member(member, prompt, seen_models=seen_models)
             except Exception as e:
@@ -1576,90 +1704,63 @@ def backtest():
 def stats():
     """On-demand report of how the AI council's verdicts have actually
     performed, aggregated from memory.json's already-graded outcomes.
-    Not a backtest against price data like backtest() is, this is a
-    backtest against the system's own real track record. Pure math over
+    Each timeframe is shown at its own checkpoints only. Pure math over
     what's already stored, no API calls, nothing new to fetch."""
     memory = load_memory()
     if not memory:
         print("No entries in memory.json yet, nothing to report on.")
         return
 
-    per_horizon = {h: {"correct": 0, "wrong": 0, "ungraded": 0, "not_due": 0} for h in HORIZONS}
+    per_cp = {tf: {f"{d}d": [0, 0] for d in cfg["checkpoints"]} for tf, cfg in TIMEFRAMES.items()}
+    waiting = {h: 0 for h in HORIZONS}
     per_ticker = {}
-    per_direction = {"BUY": {"correct": 0, "wrong": 0}, "SELL": {"correct": 0, "wrong": 0}, "HOLD": {"correct": 0, "wrong": 0}}
-    timeframes = ("day_trade", "swing_trade", "short_term")
-    per_timeframe = {tf: {"correct": 0, "wrong": 0} for tf in timeframes}
+    per_direction = {"BUY": [0, 0], "SELL": [0, 0], "HOLD": [0, 0]}
+    swing_cps = [f"{d}d" for d in TIMEFRAMES["swing_trade"]["checkpoints"]]
 
     for entry in memory:
         symbol = entry.get("symbol", "?")
-        per_ticker.setdefault(symbol, {h: {"correct": 0, "wrong": 0} for h in HORIZONS})
-        direction = parse_verdict_direction(entry.get("verdict"))
+        per_ticker.setdefault(symbol, {h: [0, 0] for h in swing_cps})
+        swing_direction = parse_verdict_direction(entry.get("verdict"))
         outcomes = entry.get("outcomes", {})
-
         for h in HORIZONS:
+            owner = CHECKPOINT_OWNER[h]
             data = outcomes.get(h, {})
-            if not data.get("checked"):
-                per_horizon[h]["not_due"] += 1
+            if not _slot_checked(data):
+                waiting[h] += 1
                 continue
-
-            swing_correct = _swing_grade(data)
-            if swing_correct is True:
-                per_horizon[h]["correct"] += 1
-                per_ticker[symbol][h]["correct"] += 1
-                if direction in per_direction:
-                    per_direction[direction]["correct"] += 1
-            elif swing_correct is False:
-                per_horizon[h]["wrong"] += 1
-                per_ticker[symbol][h]["wrong"] += 1
-                if direction in per_direction:
-                    per_direction[direction]["wrong"] += 1
-            else:
-                per_horizon[h]["ungraded"] += 1
-
-            grades = data.get("grades")
-            if grades:
-                for tf in timeframes:
-                    if grades.get(tf) is True:
-                        per_timeframe[tf]["correct"] += 1
-                    elif grades.get(tf) is False:
-                        per_timeframe[tf]["wrong"] += 1
-            elif swing_correct is not None:
-                # Old-schema entry, only ever had the one implicit
-                # swing-trade-equivalent grade.
-                if swing_correct is True:
-                    per_timeframe["swing_trade"]["correct"] += 1
-                else:
-                    per_timeframe["swing_trade"]["wrong"] += 1
+            g = (data.get("grades") or {}).get(owner)
+            if g is None:
+                continue
+            idx = 0 if g else 1
+            per_cp[owner][h][idx] += 1
+            if owner == "swing_trade":
+                per_ticker[symbol][h][idx] += 1
+                if swing_direction in per_direction:
+                    per_direction[swing_direction][idx] += 1
 
     def rate_str(correct, wrong):
         graded = correct + wrong
         return f"{correct}/{graded} correct ({correct / graded * 100:.1f}%)" if graded else "no graded data yet"
 
     print(f"Total entries in memory.json: {len(memory)}\n")
+    print("Accuracy per timeframe, each graded only at its own checkpoints against the closing price on that date:")
+    for tf, cfg in TIMEFRAMES.items():
+        c = sum(v[0] for v in per_cp[tf].values())
+        w = sum(v[1] for v in per_cp[tf].values())
+        print(f"\n  {cfg['label']} (BUY/SELL bar {cfg['bar']:g}%, HOLD within {cfg['bar'] * HOLD_BAR_MULT:g}%): {rate_str(c, w)}")
+        for h, (cc, ww) in per_cp[tf].items():
+            print(f"    {h}: {rate_str(cc, ww)}, {waiting[h]} not graded yet (not due, or waiting for a regrade/postcheck)")
 
-    print("Accuracy by verdict timeframe (day-trade/swing-trade/short-term):")
-    for tf in timeframes:
-        d = per_timeframe[tf]
-        print(f"  {tf.replace('_', '-')}: {rate_str(d['correct'], d['wrong'])}")
-    print("  (older entries from before the multi-timeframe format only ever fed swing-trade here)")
+    print("\nSwing-trade win rate by ticker:")
+    for symbol, cps in per_ticker.items():
+        lines = [f"    {h}: {rate_str(*v)}" for h, v in cps.items() if v[0] + v[1]]
+        if lines:
+            print(f"  {symbol}:")
+            print("\n".join(lines))
 
-    print("\nWin rate by horizon (swing-trade call, the one graded against every horizon):")
-    for h in HORIZONS:
-        d = per_horizon[h]
-        print(f"  {h}: {rate_str(d['correct'], d['wrong'])}, {d['ungraded']} ungraded, {d['not_due']} not due yet")
-
-    print("\nWin rate by ticker (swing-trade call):")
-    for symbol, horizons_data in per_ticker.items():
-        print(f"  {symbol}:")
-        for h in HORIZONS:
-            d = horizons_data[h]
-            if d["correct"] + d["wrong"] == 0:
-                continue
-            print(f"    {h}: {rate_str(d['correct'], d['wrong'])}")
-
-    print("\nWin rate by verdict direction (swing-trade call, across all horizons):")
-    for direction, d in per_direction.items():
-        print(f"  {direction}: {rate_str(d['correct'], d['wrong'])}")
+    print("\nSwing-trade win rate by verdict direction (across its checkpoints):")
+    for direction, (c, w) in per_direction.items():
+        print(f"  {direction}: {rate_str(c, w)}")
 
     _print_verdict_distribution(memory)
 
@@ -1756,13 +1857,17 @@ def parse_verdict_direction(verdict_text):
     return parse_all_verdicts(verdict_text)["swing_trade"]
 
 
-def grade_verdict(direction, pct_change, buy_sell_threshold=BUY_SELL_PCT, hold_threshold=HOLD_PCT):
+def grade_verdict(direction, pct_change, timeframe):
+    """Grade one call against the price move over its own window, using
+    that timeframe's bar. BUY right above +bar, SELL right below -bar,
+    HOLD right inside HOLD_BAR_MULT times the bar."""
+    bar = TIMEFRAMES[timeframe]["bar"]
     if direction == "BUY":
-        return pct_change > buy_sell_threshold
+        return pct_change > bar
     if direction == "SELL":
-        return pct_change < -buy_sell_threshold
+        return pct_change < -bar
     if direction == "HOLD":
-        return abs(pct_change) < hold_threshold
+        return abs(pct_change) < bar * HOLD_BAR_MULT
     return None
 
 
@@ -1776,8 +1881,8 @@ def build_batch_reflection_prompt(items):
     for i, (entry, label, pct_change, grades) in enumerate(items, 1):
         other_lines = "\n".join(
             f"  - {k.replace('_', '-')}: {'correct' if v else 'wrong' if v is False else 'not applicable'}"
-            for k, v in grades.items() if k != "swing_trade"
-        )
+            for k, v in grades.items() if k != "swing_trade" and v is not None
+        ) or "  (no other timeframe is graded at this checkpoint)"
         blocks.append(f"""ITEM {i}: {entry['symbol']} verdict from {entry['timestamp'][:10]}, checked at the {label} mark
 Original situation: {entry['text'][:400]}
 Verdict given: {entry['verdict'][:300]}
@@ -1816,28 +1921,31 @@ def parse_batch_reflections(response_text, count):
 
 
 def postcheck():
-    """Daily sweep: for every memory entry, check whichever horizons
-    (3d/7d/14d/30d/60d/90d) have now come due and haven't been graded
-    yet. Fetches each symbol's current price at most once per run, no
-    matter how many entries or horizons need it, then applies that price
-    across everything due. Wrong verdicts are collected during grading
-    and reflected on afterward in small batches, not one call each, a
-    big backlog shouldn't fire dozens of individual calls back to back
-    into the same rate limits."""
+    """Daily sweep: for every memory entry, grade each checkpoint that has
+    come due and isn't graded yet. Each checkpoint belongs to exactly one
+    verdict timeframe (see TIMEFRAMES), and is graded against the CLOSING
+    price on that checkpoint's own date, not the price at the moment this
+    runs. A checkpoint graded by an older method is wiped and recomputed
+    (no new reflection is written for those, to keep a big backlog fast).
+    Daily history is fetched once per symbol per run. Wrong swing calls
+    graded for the first time get batched reflections afterward."""
     memory = load_memory()
     now = datetime.now(timezone.utc)
+    today = now.date()
     updated = False
-    price_cache = {}
+    history_cache = {}
     pending_reflections = []
 
-    def current_price(symbol, fetch_symbol, is_crypto, source="alpaca"):
-        if symbol not in price_cache:
-            if is_crypto:
-                candles = fetch_kraken_candles(fetch_symbol) if source == "kraken" else fetch_crypto_candles(fetch_symbol)
-            else:
-                candles = fetch_candles(fetch_symbol)
-            price_cache[symbol] = candles["c"][-1] if candles else None
-        return price_cache[symbol]
+    def close_on(symbol, fetch_symbol, is_crypto, source, target_date):
+        """Close of the first daily bar on or after target_date, or None if
+        that bar isn't final yet (today's bar is still forming) or history
+        couldn't be fetched."""
+        if symbol not in history_cache:
+            history_cache[symbol] = fetch_daily_history(fetch_symbol, is_crypto, source)
+        for bar_date, close in history_cache[symbol]:
+            if bar_date >= target_date:
+                return close if bar_date < today else None
+        return None
 
     for entry in memory:
         try:
@@ -1851,36 +1959,46 @@ def postcheck():
         is_crypto = entry.get("is_crypto", False)
         original_price = entry.get("close_at_alert")
         outcomes = entry.setdefault("outcomes", {h: {"checked": False} for h in HORIZONS})
+        directions = parse_all_verdicts(entry.get("verdict"))
 
         for label, horizon_days in HORIZONS.items():
             slot = outcomes.setdefault(label, {"checked": False})
-            if slot.get("checked") or age_days < horizon_days:
+            if _slot_checked(slot) or age_days < horizon_days:
                 continue
 
+            regrade = bool(slot.get("checked"))  # graded before, by the old method
+            if regrade:
+                slot.clear()
+                slot["checked"] = False
+                updated = True
+
+            owner = CHECKPOINT_OWNER[label]
             if not original_price:
-                slot.update({"checked": True, "grades": {k: None for k in ("day_trade", "swing_trade", "short_term", "long_term")}})
+                slot.update({"checked": True, "grading": GRADING_VERSION, "grades": {k: None for k in TIMEFRAMES}})
                 updated = True
                 continue
 
-            price = current_price(symbol, fetch_symbol, is_crypto, source=source)
+            target_date = (entry_time + timedelta(days=horizon_days)).date()
+            price = close_on(symbol, fetch_symbol, is_crypto, source, target_date)
             if price is None:
-                print(f"{symbol}: couldn't fetch current price this run, {label} check deferred", file=sys.stderr)
+                print(f"{symbol}: no final closing price for {target_date} yet (or history unavailable), {label} check deferred", file=sys.stderr)
                 continue
 
             pct_change = (price - original_price) / original_price * 100
-            directions = parse_all_verdicts(entry.get("verdict"))
-            grades = {k: (grade_verdict(v, pct_change) if v else None) for k, v in directions.items()}
-            grades["long_term"] = None  # shown in the notification, never graded, our 90d ceiling can't test it
+            direction = directions.get(owner)
+            grades = {k: None for k in TIMEFRAMES}
+            grades[owner] = grade_verdict(direction, pct_change, owner) if direction else None
 
             slot["checked"] = True
+            slot["grading"] = GRADING_VERSION
             slot["pct_change"] = round(pct_change, 2)
             slot["grades"] = grades
 
-            if grades.get("swing_trade") is False:
+            if owner == "swing_trade" and grades[owner] is False and not regrade:
                 pending_reflections.append((slot, entry, label, pct_change, grades))
 
-            summary = ", ".join(f"{k}={'correct' if v else 'wrong' if v is False else 'n/a'}" for k, v in grades.items())
-            print(f"{symbol}: {label} graded, {pct_change:+.1f}%, {summary}")
+            g = grades[owner]
+            print(f"{symbol}: {label} {TIMEFRAMES[owner]['label']} graded, {pct_change:+.1f}%, {'correct' if g else 'wrong' if g is False else 'n/a'}{' (regraded)' if regrade else ''}")
             updated = True
 
     REFLECTION_BATCH_SIZE = 5
