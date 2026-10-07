@@ -534,6 +534,26 @@ STATS_K = 10  # graded neighbors used for the track-record numbers
 LOW_SIMILARITY = 0.75
 
 
+# Entries whose verdict text shows the council pipeline itself broke (API
+# failure, missing team, etc.) are not real analytical calls. Grading them
+# as WRONG would pollute the track record and closest-wrong callout.
+_FAILURE_MARKERS = (
+    "no response", "arbiter failed", "chief arbiter failed", "failed (",
+    "content moderation", "unavailable", "no analyst", "neither input",
+    "did not meaningfully agree", "no reviewer", "no substantive",
+    "evaluated different things",
+)
+
+
+def _entry_pipeline_failure(entry):
+    v = (entry.get("verdict") or "").lower()
+    r = " ".join(
+        (d.get("reflection") or "") for d in (entry.get("outcomes") or {}).values()
+    ).lower()
+    return (any(m in v for m in _FAILURE_MARKERS)
+            or "no analyst" in r or "process gap" in r or "abdicat" in r)
+
+
 def _entry_graded(entry):
     return any(d.get("checked") for d in (entry.get("outcomes") or {}).values())
 
@@ -602,7 +622,8 @@ def retrieve_memory_context(text, memory, symbol=None, top_k=RAG_TOP_K):
         ctx["fallback"] = True
 
     ctx["similar"] = [en for _, en in ranked[:top_k]]
-    graded = [(s, en) for s, en in ranked if _entry_graded(en)]
+    graded = [(s, en) for s, en in ranked
+              if _entry_graded(en) and not _entry_pipeline_failure(en)]
     ctx["cluster_stats"] = _cluster_stats([en for _, en in graded[:STATS_K]])
     for s, en in graded:
         if _entry_swing_wrong(en):
