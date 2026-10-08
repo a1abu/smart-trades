@@ -71,20 +71,25 @@ RAG_TOP_K = 3
 
 # Each of the four verdict timeframes is graded only at its OWN checkpoints
 # (days after the alert), against the closing price on that date, with its
-# own BUY/SELL bar in percent. HOLD is right if price stays within
-# HOLD_BAR_MULT times the bar. Long-term needs 120+ days to test.
+# own bar in percent. BUY is right above +bar, SELL below -bar, and HOLD
+# within HOLD_BAR_MULT times the bar, so with 1.0 the three calls split the
+# outcomes cleanly with no overlap. Long-term needs 120+ days to test.
 TIMEFRAMES = {
     "day_trade":   {"checkpoints": (1,),           "bar": 1.0, "label": "day-trade"},
     "swing_trade": {"checkpoints": (3, 7, 14, 30), "bar": 3.0, "label": "swing-trade"},
     "short_term":  {"checkpoints": (60, 90),       "bar": 3.0, "label": "short-term"},
     "long_term":   {"checkpoints": (120, 180),     "bar": 5.0, "label": "long-term"},
 }
-HOLD_BAR_MULT = 2.0
+HOLD_BAR_MULT = 1.0
 HORIZONS = {f"{d}d": d for d in sorted({d for t in TIMEFRAMES.values() for d in t["checkpoints"]})}
 CHECKPOINT_OWNER = {f"{d}d": tf for tf, t in TIMEFRAMES.items() for d in t["checkpoints"]}
 # Bump when the grading method changes. A stored grade without this exact
 # version came from an older method and is ignored, then recomputed by postcheck.
-GRADING_VERSION = 2
+# Version 2 graded against the right dates but let HOLD win within twice the
+# bar. Version 3 (this one) narrows HOLD to the bar. A version 2 grade is
+# safely rescored from its stored price move, see _migrate_grades.
+GRADING_VERSION = 3
+RESCORABLE_VERSIONS = (2,)
 
 
 def _window_text(cfg):
@@ -566,15 +571,55 @@ def _get_model():
     return _MODEL
 
 
+_MIGRATION_COUNT = 0  # slots rescored by the most recent load_memory call
+
+
+def _migrate_grades(memory):
+    """Rescore checkpoints graded by a previous grading version, using the
+    price move already stored on each one. No prices fetched, no AI calls,
+    instant. Idempotent. Returns how many slots changed. Keeps any stored
+    reflection that still describes a wrong call, drops it otherwise."""
+    changed = 0
+    for entry in memory:
+        outcomes = entry.get("outcomes") or {}
+        directions = None
+        for label, slot in outcomes.items():
+            if not (slot.get("checked") and slot.get("grading") in RESCORABLE_VERSIONS):
+                continue
+            owner = CHECKPOINT_OWNER.get(label)
+            if owner is None:
+                continue
+            if directions is None:
+                directions = parse_all_verdicts(entry.get("verdict"))
+            pct = slot.get("pct_change")
+            direction = directions.get(owner)
+            grades = {k: None for k in TIMEFRAMES}
+            if pct is not None and direction:
+                grades[owner] = grade_verdict(direction, pct, owner)
+            slot["grades"] = grades
+            slot["grading"] = GRADING_VERSION
+            if grades[owner] is not False:
+                slot.pop("reflection", None)
+            changed += 1
+    return changed
+
+
 def load_memory():
+    global _MIGRATION_COUNT
+    _MIGRATION_COUNT = 0
     if not os.path.exists(MEMORY_FILE):
         return []
     try:
         with open(MEMORY_FILE) as f:
-            return json.load(f)
+            memory = json.load(f)
     except Exception as e:
         print(f"memory.json failed to load ({e}), starting fresh", file=sys.stderr)
         return []
+    try:
+        _MIGRATION_COUNT = _migrate_grades(memory)
+    except Exception as e:
+        print(f"grade migration failed ({e}), leaving stored grades as they are", file=sys.stderr)
+    return memory
 
 
 def save_memory(memory):
@@ -1893,7 +1938,7 @@ def grade_verdict(direction, pct_change, timeframe):
     if direction == "SELL":
         return pct_change < -bar
     if direction == "HOLD":
-        return abs(pct_change) < bar * HOLD_BAR_MULT
+        return abs(pct_change) <= bar * HOLD_BAR_MULT
     return None
 
 
@@ -1958,7 +2003,7 @@ def postcheck():
     memory = load_memory()
     now = datetime.now(timezone.utc)
     today = now.date()
-    updated = False
+    updated = _MIGRATION_COUNT > 0  # rescored slots need saving even if nothing else changes
     history_cache = {}
 
     def close_on(symbol, fetch_symbol, is_crypto, source, target_date):
