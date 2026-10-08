@@ -1716,11 +1716,13 @@ def stats():
     per_ticker = {}
     per_direction = {"BUY": [0, 0], "SELL": [0, 0], "HOLD": [0, 0]}
     swing_cps = [f"{d}d" for d in TIMEFRAMES["swing_trade"]["checkpoints"]]
+    records = {tf: [] for tf in TIMEFRAMES}  # (checkpoint, direction called, pct move) per graded checkpoint
 
     for entry in memory:
         symbol = entry.get("symbol", "?")
         per_ticker.setdefault(symbol, {h: [0, 0] for h in swing_cps})
-        swing_direction = parse_verdict_direction(entry.get("verdict"))
+        entry_directions = parse_all_verdicts(entry.get("verdict"))
+        swing_direction = entry_directions["swing_trade"]
         outcomes = entry.get("outcomes", {})
         for h in HORIZONS:
             owner = CHECKPOINT_OWNER[h]
@@ -1733,6 +1735,8 @@ def stats():
                 continue
             idx = 0 if g else 1
             per_cp[owner][h][idx] += 1
+            if data.get("pct_change") is not None and entry_directions.get(owner):
+                records[owner].append((h, entry_directions[owner], data["pct_change"]))
             if owner == "swing_trade":
                 per_ticker[symbol][h][idx] += 1
                 if swing_direction in per_direction:
@@ -1742,14 +1746,33 @@ def stats():
         graded = correct + wrong
         return f"{correct}/{graded} correct ({correct / graded * 100:.1f}%)" if graded else "no graded data yet"
 
+    def baseline_str(tf, recs):
+        """What dumb strategies would have scored on exactly the same graded
+        checkpoints: always BUY, always HOLD, always SELL, and a random guess
+        that follows the system's own BUY/HOLD/SELL mix."""
+        if not recs:
+            return ""
+        n = len(recs)
+        const = {d: sum(1 for _, _, pct in recs if grade_verdict(d, pct, tf)) / n * 100 for d in ("BUY", "HOLD", "SELL")}
+        mix = sum(sum(1 for _, dd, _ in recs if dd == d) / n * const[d] for d in const)
+        return (f"baseline on the same checkpoints: always BUY {const['BUY']:.0f}%, always HOLD {const['HOLD']:.0f}%, "
+                f"always SELL {const['SELL']:.0f}%, random guess with the system's own call mix {mix:.0f}%")
+
     print(f"Total entries in memory.json: {len(memory)}\n")
     print("Accuracy per timeframe, each graded only at its own checkpoints against the closing price on that date:")
+    print("(each timeframe also shows a baseline: what dumb strategies would have scored on the same checkpoints)")
     for tf, cfg in TIMEFRAMES.items():
         c = sum(v[0] for v in per_cp[tf].values())
         w = sum(v[1] for v in per_cp[tf].values())
         print(f"\n  {cfg['label']} (BUY/SELL bar {cfg['bar']:g}%, HOLD within {cfg['bar'] * HOLD_BAR_MULT:g}%): {rate_str(c, w)}")
+        overall_base = baseline_str(tf, records[tf])
+        if overall_base:
+            print(f"    {overall_base}")
         for h, (cc, ww) in per_cp[tf].items():
             print(f"    {h}: {rate_str(cc, ww)}, {waiting[h]} not graded yet (not due, or waiting for a regrade/postcheck)")
+            cp_base = baseline_str(tf, [r for r in records[tf] if r[0] == h])
+            if cp_base:
+                print(f"        {cp_base}")
 
     print("\nSwing-trade win rate by ticker:")
     for symbol, cps in per_ticker.items():
@@ -1759,8 +1782,11 @@ def stats():
             print("\n".join(lines))
 
     print("\nSwing-trade win rate by verdict direction (across its checkpoints):")
+    swing_recs = records["swing_trade"]
     for direction, (c, w) in per_direction.items():
-        print(f"  {direction}: {rate_str(c, w)}")
+        const = (sum(1 for _, _, pct in swing_recs if grade_verdict(direction, pct, "swing_trade")) / len(swing_recs) * 100) if swing_recs else None
+        base = f", always {direction} would have scored {const:.0f}%" if const is not None else ""
+        print(f"  {direction}: {rate_str(c, w)}{base}")
 
     _print_verdict_distribution(memory)
 
@@ -1926,15 +1952,14 @@ def postcheck():
     verdict timeframe (see TIMEFRAMES), and is graded against the CLOSING
     price on that checkpoint's own date, not the price at the moment this
     runs. A checkpoint graded by an older method is wiped and recomputed
-    (no new reflection is written for those, to keep a big backlog fast).
-    Daily history is fetched once per symbol per run. Wrong swing calls
-    graded for the first time get batched reflections afterward."""
+    Daily history is fetched once per symbol per run. Afterward, wrong
+    swing calls with no "why" note yet get batched reflections, newest
+    first, capped per run so a big backlog fills in over several runs."""
     memory = load_memory()
     now = datetime.now(timezone.utc)
     today = now.date()
     updated = False
     history_cache = {}
-    pending_reflections = []
 
     def close_on(symbol, fetch_symbol, is_crypto, source, target_date):
         """Close of the first daily bar on or after target_date, or None if
@@ -1994,12 +2019,27 @@ def postcheck():
             slot["pct_change"] = round(pct_change, 2)
             slot["grades"] = grades
 
-            if owner == "swing_trade" and grades[owner] is False and not regrade:
-                pending_reflections.append((slot, entry, label, pct_change, grades))
-
             g = grades[owner]
             print(f"{symbol}: {label} {TIMEFRAMES[owner]['label']} graded, {pct_change:+.1f}%, {'correct' if g else 'wrong' if g is False else 'n/a'}{' (regraded)' if regrade else ''}")
             updated = True
+
+    # Reflections: every wrong swing call that has no "why" note yet, newest
+    # entries first, capped per run. New wrong calls and re-graded ones are
+    # treated the same, so a big backlog fills in over several runs instead
+    # of one long run hammering the free-tier AI limits.
+    REFLECTION_MAX_PER_RUN = 25
+    pending_reflections = []
+    for entry in sorted(memory, key=lambda e: e.get("timestamp", ""), reverse=True):
+        if _entry_pipeline_failure(entry):
+            continue
+        for label, slot in (entry.get("outcomes") or {}).items():
+            if (_slot_checked(slot) and CHECKPOINT_OWNER.get(label) == "swing_trade"
+                    and (slot.get("grades") or {}).get("swing_trade") is False
+                    and not slot.get("reflection")):
+                pending_reflections.append((slot, entry, label, slot.get("pct_change") or 0.0, slot["grades"]))
+    if len(pending_reflections) > REFLECTION_MAX_PER_RUN:
+        print(f"{len(pending_reflections)} wrong swing calls still need a reflection, doing the newest {REFLECTION_MAX_PER_RUN} this run, the rest on later runs")
+        pending_reflections = pending_reflections[:REFLECTION_MAX_PER_RUN]
 
     REFLECTION_BATCH_SIZE = 5
     for i in range(0, len(pending_reflections), REFLECTION_BATCH_SIZE):
@@ -2014,6 +2054,7 @@ def postcheck():
             for (slot, entry, label, pct_change, grades), reflection in zip(batch, reflections):
                 if reflection:
                     slot["reflection"] = reflection[:500]
+                    updated = True
                 else:
                     print(f"{entry['symbol']}: batch reflection didn't parse for {label}, grading without one", file=sys.stderr)
         except Exception as e:
